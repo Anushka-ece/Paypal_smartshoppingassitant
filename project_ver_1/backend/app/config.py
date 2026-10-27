@@ -11,3 +11,5 @@ PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET", "")
 PAYPAL_BASE_URL = os.getenv("PAYPAL_BASE_URL", "https://api-m.sandbox.paypal.com")
 TOKEN_ENCRYPTION_KEY = os.getenv("TOKEN_ENCRYPTION_KEY", "default-dev-secret-key-change-in-production-32b")
 PAYPAL_REDIRECT_URI = os.getenv("PAYPAL_REDIRECT_URI", "http://localhost:8000/api/auth/paypal/callback")
+PAYPAL_WEBHOOK_ID = os.getenv("PAYPAL_WEBHOOK_ID", "mock_webhook_id")
+
