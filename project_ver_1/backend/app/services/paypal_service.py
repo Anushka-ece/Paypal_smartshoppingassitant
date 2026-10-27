@@ -1,6 +1,7 @@
 import json
 import urllib.parse
-from typing import Optional, Dict, Any, Union
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, Union, List
 import httpx
 from app.config import (
     PAYPAL_BASE_URL,
@@ -10,6 +11,17 @@ from app.config import (
     PAYPAL_WEBHOOK_ID,
 )
 from app.security.crypto import decrypt_token
+
+
+class AwaitableList(list):
+    """
+    List subclass that can be returned synchronously or awaited in async contexts.
+    Allows seamless usage for both Celery (sync) and FastAPI/asyncio callers.
+    """
+    def __await__(self):
+        async def _coro():
+            return self
+        return _coro().__await__()
 
 
 class PayPalService:
@@ -256,6 +268,246 @@ class PayPalService:
                 return False
         except Exception:
             return False
+
+    @staticmethod
+    def parse_transaction_record(raw_record: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Parses a transaction record from PayPal Reporting API (/v1/reporting/transactions)
+        or normalized dictionary format into standard internal fields:
+        transaction_id, amount, currency, merchant_name, status, initiation_date, description.
+        """
+        tx_info = raw_record.get("transaction_info") or raw_record
+        payer_info = raw_record.get("payer_info") or {}
+        cart_info = raw_record.get("cart_info") or {}
+
+        # 1. Transaction ID
+        transaction_id = (
+            tx_info.get("transaction_id")
+            or raw_record.get("transaction_id")
+            or tx_info.get("id")
+            or raw_record.get("id")
+        )
+
+        # 2. Amount and Currency
+        raw_amount_obj = tx_info.get("transaction_amount")
+        if isinstance(raw_amount_obj, dict):
+            amount_val = raw_amount_obj.get("value", 0.0)
+            currency = raw_amount_obj.get("currency_code", "USD")
+        elif raw_amount_obj is not None:
+            amount_val = raw_amount_obj
+            currency = tx_info.get("currency") or raw_record.get("currency", "USD")
+        else:
+            amount_val = raw_record.get("amount", 0.0)
+            currency = raw_record.get("currency", "USD")
+
+        try:
+            amount = abs(float(amount_val))
+        except (ValueError, TypeError):
+            amount = 0.0
+
+        # 3. Merchant Name
+        merchant_name = None
+        payer_name = payer_info.get("payer_name")
+        if isinstance(payer_name, dict):
+            merchant_name = (
+                payer_name.get("alternate_full_name")
+                or f"{payer_name.get('given_name', '')} {payer_name.get('surname', '')}".strip()
+            )
+        elif isinstance(payer_name, str):
+            merchant_name = payer_name
+
+        if not merchant_name:
+            merchant_name = payer_info.get("email_address")
+
+        if (
+            not merchant_name
+            and isinstance(cart_info.get("item_details"), list)
+            and len(cart_info["item_details"]) > 0
+        ):
+            first_item = cart_info["item_details"][0]
+            if isinstance(first_item, dict):
+                merchant_name = first_item.get("item_name")
+
+        if not merchant_name:
+            merchant_name = (
+                tx_info.get("transaction_subject")
+                or tx_info.get("transaction_note")
+                or raw_record.get("merchant_name")
+                or "PayPal Merchant"
+            )
+
+        # 4. Status mapping
+        raw_status = (
+            tx_info.get("transaction_status")
+            or raw_record.get("status")
+            or "COMPLETED"
+        )
+        status_map = {
+            "S": "COMPLETED",
+            "SUCCESS": "COMPLETED",
+            "COMPLETED": "COMPLETED",
+            "P": "PENDING",
+            "PENDING": "PENDING",
+            "D": "DENIED",
+            "DENIED": "DENIED",
+            "V": "REFUNDED",
+            "REVERSED": "REFUNDED",
+            "REFUNDED": "REFUNDED",
+            "F": "FAILED",
+            "FAILED": "FAILED",
+        }
+        status = status_map.get(str(raw_status).upper(), str(raw_status))
+
+        # 5. Initiation Date
+        initiation_date = (
+            tx_info.get("transaction_initiation_date")
+            or tx_info.get("transaction_updated_date")
+            or raw_record.get("initiation_date")
+            or raw_record.get("created_at")
+        )
+        if not initiation_date:
+            initiation_date = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # 6. Description
+        description = (
+            tx_info.get("transaction_note")
+            or tx_info.get("transaction_subject")
+            or raw_record.get("description")
+            or f"PayPal purchase: {merchant_name}"
+        )
+
+        return {
+            "transaction_id": transaction_id,
+            "amount": amount,
+            "currency": currency,
+            "merchant_name": merchant_name,
+            "status": status,
+            "raw_status": raw_status,
+            "initiation_date": str(initiation_date),
+            "description": description,
+            "raw_record": raw_record,
+        }
+
+    def fetch_historical_transactions(
+        self,
+        access_token: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page_size: int = 100,
+    ) -> AwaitableList:
+        """
+        Fetches historical transactions from PayPal's Reporting API (/v1/reporting/transactions).
+        Handles pagination, automatic mock fallback, and parsed record mapping.
+        Callable synchronously or awaitable in async contexts.
+        """
+        raw_token = access_token
+        try:
+            raw_token = decrypt_token(access_token)
+        except Exception:
+            raw_token = access_token
+
+        is_mock = (
+            not raw_token
+            or raw_token.startswith("mock")
+            or raw_token.startswith("test")
+            or self.client_id in ("mock_client_id", "mock", "test")
+        )
+
+        if is_mock:
+            now = datetime.utcnow()
+            mock_records = [
+                {
+                    "transaction_id": "TX-MOCK-001",
+                    "amount": 45.00,
+                    "currency": "USD",
+                    "merchant_name": "Steam Games",
+                    "status": "COMPLETED",
+                    "initiation_date": (now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "description": "Steam Games digital purchase",
+                },
+                {
+                    "transaction_id": "TX-MOCK-002",
+                    "amount": 18.50,
+                    "currency": "USD",
+                    "merchant_name": "Uber",
+                    "status": "COMPLETED",
+                    "initiation_date": (now - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "description": "Uber ride",
+                },
+                {
+                    "transaction_id": "TX-MOCK-003",
+                    "amount": 12.99,
+                    "currency": "USD",
+                    "merchant_name": "Netflix",
+                    "status": "COMPLETED",
+                    "initiation_date": (now - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "description": "Netflix monthly subscription",
+                },
+                {
+                    "transaction_id": "TX-MOCK-004",
+                    "amount": 89.20,
+                    "currency": "USD",
+                    "merchant_name": "Amazon",
+                    "status": "COMPLETED",
+                    "initiation_date": (now - timedelta(days=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "description": "Amazon online shopping",
+                },
+            ]
+            return AwaitableList(mock_records)
+
+        now = datetime.utcnow()
+        if not end_date:
+            end_date = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if not start_date:
+            start_date = (now - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        url = f"{self.base_url}/v1/reporting/transactions"
+        headers = {
+            "Authorization": f"Bearer {raw_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        all_transactions = []
+        page = 1
+        with httpx.Client(timeout=20.0) as client:
+            while True:
+                params = {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "page_size": page_size,
+                    "page": page,
+                    "fields": "all",
+                }
+                resp = client.get(url, headers=headers, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                details = data.get("transaction_details", [])
+                for item in details:
+                    parsed = self.parse_transaction_record(item)
+                    all_transactions.append(parsed)
+
+                total_pages = data.get("total_pages", 1)
+                if page >= total_pages or not details:
+                    break
+                page += 1
+
+        return AwaitableList(all_transactions)
+
+    async def fetch_historical_transactions_async(
+        self,
+        access_token: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page_size: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Asynchronous wrapper for fetch_historical_transactions."""
+        return self.fetch_historical_transactions(
+            access_token=access_token,
+            start_date=start_date,
+            end_date=end_date,
+            page_size=page_size,
+        )
 
 
 

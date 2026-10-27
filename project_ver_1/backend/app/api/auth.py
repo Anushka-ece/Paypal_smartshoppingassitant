@@ -1,4 +1,5 @@
 import json
+import logging
 import urllib.parse
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, status
@@ -11,6 +12,8 @@ from app.models.user import User
 from app.models.account import Account, AccountType
 from app.services.paypal_service import PayPalService
 from app.security.crypto import encrypt_token
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication & PayPal OAuth"])
 
@@ -141,6 +144,29 @@ async def _handle_callback_logic(
 
         db.commit()
         db.refresh(account)
+
+        # Trigger historical transaction ingestion via Celery (or synchronous fallback)
+        try:
+            from app.workers.celery_worker import sync_historical_transactions_task
+            from app.api.webhooks import get_redis_client
+
+            is_broker_ready = bool(get_redis_client() is not None)
+            if is_broker_ready:
+                try:
+                    sync_historical_transactions_task.delay(account.id)
+                except Exception as celery_err:
+                    logger.info(f"Celery delay failed ({celery_err}), falling back to sync: {celery_err}")
+                    try:
+                        sync_historical_transactions_task(account.id, db=db)
+                    except Exception as sync_err:
+                        logger.warning(f"Historical sync fallback failed: {sync_err}")
+            else:
+                try:
+                    sync_historical_transactions_task(account.id, db=db)
+                except Exception as sync_err:
+                    logger.warning(f"Synchronous historical sync fallback failed: {sync_err}")
+        except Exception as e:
+            logger.warning(f"Could not trigger historical sync for account {account.id}: {e}")
 
     return {
         "status": "success",

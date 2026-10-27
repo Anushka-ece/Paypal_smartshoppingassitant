@@ -9,6 +9,8 @@ from sqlalchemy import (
     ForeignKey,
     CheckConstraint,
     PrimaryKeyConstraint,
+    event,
+    select,
 )
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -30,7 +32,7 @@ class LedgerEntry(Base):
         CheckConstraint("amount > 0", name="ck_ledger_positive_amount"),
     )
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id = Column(Integer, primary_key=True)
     created_at = Column(DateTime(timezone=True), primary_key=True, default=datetime.utcnow, nullable=False)
     debit_account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
     credit_account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
@@ -58,3 +60,15 @@ class LedgerEntry(Base):
                 raise ValueError("Debit and credit accounts must be distinct in a double-entry ledger.")
         if self.amount is not None and self.amount <= 0:
             raise ValueError("Ledger entry amount must be greater than zero.")
+
+
+@event.listens_for(LedgerEntry, "before_insert")
+def set_ledger_entry_id(mapper, connection, target):
+    if target.id is None:
+        stmt = (
+            select(LedgerEntry.id)
+            .order_by(LedgerEntry.id.desc())
+            .limit(1)
+        )
+        val = connection.scalar(stmt)
+        target.id = (val or 0) + 1
