@@ -1,0 +1,13 @@
+{
+  "name": "paypal-family-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "expo start"
+  },
+  "dependencies": {
+    "react": "18.2.0",
+    "react-native": "0.73.2",
+    "expo": "~50.0.0"
+  }
+}
