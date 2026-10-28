@@ -19,7 +19,23 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install -r project_ver_1/backend/tests/requirements-test.txt || pip install pytest httpx
+      - name: Initialize test schema
+        working-directory: project_ver_1/backend
+        run: alembic upgrade head
       - name: Run Tests
         run: |
-          pytest project_ver_1/backend/tests/
+          python -m pytest project_ver_1/backend/tests/ -q
+
+  frontend-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: project_ver_1/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm run build

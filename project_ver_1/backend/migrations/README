@@ -1,0 +1,1 @@
+Alembic schema migrations are tracked in this folder. Use `alembic upgrade head` from backend/ to initialize a database and create a new revision when models change. Production should not use Base.metadata.create_all().
