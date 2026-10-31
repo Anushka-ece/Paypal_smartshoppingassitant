@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.api import auth, webhooks
+from app.api import auth, webhooks, transactions, guardrails
 
 app = FastAPI(title="PayPal Family Budgeting API", version="1.0.0")
 
@@ -11,6 +11,13 @@ app.include_router(auth.router)
 app.include_router(webhooks.router, prefix="/api")
 app.include_router(webhooks.router)
 
+# Register Transactions routes
+app.include_router(transactions.router, prefix="/api")
+app.include_router(transactions.router)
+
+# Register Guardrails routes
+app.include_router(guardrails.router, prefix="/api")
+app.include_router(guardrails.router)
 
 
 @app.get("/")
