@@ -199,25 +199,23 @@ def handle_refund(
 
     tx = None
     new_status = "REFUNDED"
-    if db is not None and parent_id:
-        tx = (
-            db.query(Transaction)
-            .filter(
-                (Transaction.paypal_transaction_id == parent_id)
-                | (Transaction.parent_payment_id == parent_id)
+    if db is not None:
+        from app.api.budgets import reconcile_refund
+        # Ensure parent_payment_id is populated on resource if present under alias
+        if not resource.get("parent_payment_id") and parent_id:
+            resource["parent_payment_id"] = parent_id
+        reconcile_res = reconcile_refund(resource, db=db)
+        if parent_id:
+            tx = (
+                db.query(Transaction)
+                .filter(
+                    (Transaction.paypal_transaction_id == parent_id)
+                    | (Transaction.parent_payment_id == parent_id)
+                )
+                .first()
             )
-            .first()
-        )
-        if tx:
-            tx.refund_id = refund_id
-            if refund_amount >= tx.amount:
-                tx.status = TransactionStatus.REFUNDED.value
+            if tx:
                 new_status = tx.status
-            else:
-                tx.status = TransactionStatus.PARTIALLY_REFUNDED.value
-                new_status = tx.status
-            db.commit()
-            db.refresh(tx)
 
     return {
         "action": "refund_reconciled",
