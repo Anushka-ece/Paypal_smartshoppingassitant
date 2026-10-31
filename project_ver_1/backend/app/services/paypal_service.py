@@ -511,6 +511,129 @@ class PayPalService:
 
 
 
+    async def execute_payout(
+        self,
+        receiver_email: str,
+        amount: float,
+        idempotency_key: str,
+        currency: str = "USD",
+        note: str = "Automated Family Allowance Disbursement",
+    ) -> Dict[str, Any]:
+        """
+        Executes a PayPal Payout (POST /v1/payments/payouts) with idempotency key.
+        """
+        if not self.client_id or not self.client_secret or self.client_id.startswith("mock") or self.client_id.startswith("test"):
+            # Mock sandbox response
+            return {
+                "batch_id": f"PAYOUT-BATCH-{idempotency_key[:16]}",
+                "status": "SUCCESS",
+                "receiver": receiver_email,
+                "amount": amount,
+                "currency": currency,
+                "idempotency_key": idempotency_key,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+
+        url = f"{self.base_url}/v1/payments/payouts"
+        token_info = await self.get_access_token()
+        token = token_info.get("access_token", "")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "PayPal-Request-Id": idempotency_key,
+        }
+
+        payload = {
+            "sender_batch_header": {
+                "sender_batch_id": f"batch-{idempotency_key}",
+                "email_subject": "You have an allowance payout!",
+                "email_message": note,
+            },
+            "items": [
+                {
+                    "recipient_type": "EMAIL",
+                    "amount": {"value": f"{amount:.2f}", "currency": currency},
+                    "note": note,
+                    "sender_item_id": f"item-{idempotency_key}",
+                    "receiver": receiver_email,
+                }
+            ],
+        }
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "batch_id": data.get("batch_header", {}).get("payout_batch_id"),
+                "status": data.get("batch_header", {}).get("batch_status", "PENDING"),
+                "receiver": receiver_email,
+                "amount": amount,
+                "currency": currency,
+                "idempotency_key": idempotency_key,
+            }
+
+    async def create_order_for_approval(
+        self,
+        amount: float,
+        currency: str = "USD",
+        description: str = "Family Pre-Purchase Request",
+    ) -> Dict[str, Any]:
+        """Creates a PayPal Order for pre-approved child store requests."""
+        if not self.client_id or not self.client_secret or self.client_id.startswith("mock") or self.client_id.startswith("test"):
+            return {
+                "id": f"ORDER-MOCK-{int(time.time())}",
+                "status": "CREATED",
+                "amount": amount,
+                "currency": currency,
+            }
+
+        url = f"{self.base_url}/v2/checkout/orders"
+        token_info = await self.get_access_token()
+        token = token_info.get("access_token", "")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "intent": "CAPTURE",
+            "purchase_units": [
+                {
+                    "amount": {"currency_code": currency, "value": f"{amount:.2f}"},
+                    "description": description,
+                }
+            ],
+        }
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def capture_approved_order(self, order_id: str) -> Dict[str, Any]:
+        """Captures a pre-approved PayPal Order."""
+        if not self.client_id or not self.client_secret or self.client_id.startswith("mock") or self.client_id.startswith("test"):
+            return {
+                "id": order_id,
+                "status": "COMPLETED",
+                "capture_id": f"CAPTURE-{order_id}",
+            }
+
+        url = f"{self.base_url}/v2/checkout/orders/{order_id}/capture"
+        token_info = await self.get_access_token()
+        token = token_info.get("access_token", "")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+
+
 # Legacy helper placeholders
 def get_paypal_access_token():
     service = PayPalService()
@@ -518,4 +641,10 @@ def get_paypal_access_token():
 
 
 def execute_payout(recipient_email: str, amount: float, currency: str = "USD"):
-    pass
+    service = PayPalService()
+    return service.execute_payout(
+        receiver_email=recipient_email,
+        amount=amount,
+        idempotency_key=f"legacy-{int(time.time())}",
+        currency=currency,
+    )
