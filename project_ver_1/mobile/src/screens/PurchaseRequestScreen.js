@@ -1,46 +1,81 @@
 import React, { useState } from 'react';
-import { StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { StyleSheet, Text, View, TextInput, TouchableOpacity, Alert } from 'react-native';
 
-export default function PurchaseRequestScreen({ onSubmit, onCancel }) {
-  const [merchant, setMerchant] = useState('');
-  const [itemUrl, setItemUrl] = useState('');
+export default function PurchaseRequestScreen() {
+  const [itemName, setItemName] = useState('');
+  const [storeUrl, setStoreUrl] = useState('');
   const [amount, setAmount] = useState('');
-  const [note, setNote] = useState('');
-  const [error, setError] = useState('');
+  const [submitted, setSubmitted] = useState(false);
 
-  function submit() {
-    const parsedAmount = Number(amount);
-    if (!merchant.trim() || !Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-      setError('Enter the store and a valid positive amount.');
+  const handleSubmit = () => {
+    if (!itemName || !amount) {
+      Alert.alert('Error', 'Please fill in item name and amount.');
       return;
     }
-    if (itemUrl && !/^https:\/\//i.test(itemUrl)) {
-      setError('Use a secure https:// link, or leave the link blank.');
-      return;
-    }
-    setError('');
-    onSubmit?.({ merchant: merchant.trim(), item_url: itemUrl.trim(), amount: parsedAmount, currency: 'USD', note: note.trim() });
-  }
+    setSubmitted(true);
+  };
 
   return (
-    <View style={styles.page}>
-      <Text style={styles.eyebrow}>ASK BEFORE YOU BUY</Text>
-      <Text style={styles.title}>Purchase request</Text>
-      <Text style={styles.subtitle}>Send the details to your parent for approval. Submitting a request does not pay the store.</Text>
-      <TextInput value={merchant} onChangeText={setMerchant} placeholder="Store or merchant" style={styles.input} />
-      <TextInput value={itemUrl} onChangeText={setItemUrl} placeholder="Product link (optional)" autoCapitalize="none" keyboardType="url" style={styles.input} />
-      <TextInput value={amount} onChangeText={setAmount} placeholder="Amount in USD" keyboardType="decimal-pad" style={styles.input} />
-      <TextInput value={note} onChangeText={setNote} placeholder="Why do you want it? (optional)" multiline style={[styles.input, styles.multiline]} />
-      {!!error && <Text style={styles.error}>{error}</Text>}
-      <TouchableOpacity style={styles.button} onPress={submit}><Text style={styles.buttonText}>Send request</Text></TouchableOpacity>
-      <TouchableOpacity style={styles.cancel} onPress={onCancel}><Text style={styles.cancelText}>Cancel</Text></TouchableOpacity>
+    <View style={styles.container}>
+      <Text style={styles.title}>Request a Store Purchase</Text>
+      <Text style={styles.sub}>Submit an item link for parents to review and approve</Text>
+
+      {submitted ? (
+        <View style={styles.successBox}>
+          <Text style={styles.successTitle}>✅ Request Sent!</Text>
+          <Text style={styles.successSub}>
+            Your parents received an instant approval alert for "{itemName}" (${amount}).
+          </Text>
+          <TouchableOpacity style={styles.button} onPress={() => setSubmitted(false)}>
+            <Text style={styles.buttonText}>Submit Another</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <View style={styles.form}>
+          <Text style={styles.label}>Item Name</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="e.g. Science Fair Poster Board"
+            value={itemName}
+            onChangeText={setItemName}
+          />
+
+          <Text style={styles.label}>Store Link / Website URL</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="e.g. https://amazon.com/dp/..."
+            value={storeUrl}
+            onChangeText={setStoreUrl}
+          />
+
+          <Text style={styles.label}>Estimated Cost ($)</Text>
+          <TextInput
+            style={styles.input}
+            placeholder="12.99"
+            keyboardType="numeric"
+            value={amount}
+            onChangeText={setAmount}
+          />
+
+          <TouchableOpacity style={styles.button} onPress={handleSubmit}>
+            <Text style={styles.buttonText}>Send Request to Parents</Text>
+          </TouchableOpacity>
+        </View>
+      )}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  page: { flex: 1, backgroundColor: '#f6f8f6', padding: 23, paddingTop: 55 }, eyebrow: { color: '#75817b', fontSize: 11, letterSpacing: 1.3, fontWeight: '700' },
-  title: { color: '#17231e', fontSize: 27, fontWeight: '800', marginTop: 8 }, subtitle: { color: '#75817b', fontSize: 13, lineHeight: 19, marginVertical: 13 },
-  input: { padding: 14, backgroundColor: '#fff', borderColor: '#e7ece8', borderWidth: 1, borderRadius: 12, marginBottom: 10, color: '#17231e' }, multiline: { minHeight: 86, textAlignVertical: 'top' },
-  button: { backgroundColor: '#006b52', padding: 15, borderRadius: 12, alignItems: 'center', marginTop: 5 }, buttonText: { color: '#fff', fontWeight: '700' }, cancel: { padding: 13, alignItems: 'center' }, cancelText: { color: '#75817b', fontWeight: '600' }, error: { color: '#b64040', marginBottom: 8, fontSize: 12 },
+  container: { flex: 1, backgroundColor: '#f8fafc', padding: 16 },
+  title: { fontSize: 20, fontWeight: '800', color: '#003087', marginBottom: 4 },
+  sub: { fontSize: 13, color: '#64748b', marginBottom: 20 },
+  form: { backgroundColor: '#fff', padding: 16, borderRadius: 12, borderWidth: 1, borderColor: '#e2e8f0' },
+  label: { fontSize: 13, fontWeight: '600', color: '#334155', marginBottom: 6 },
+  input: { borderWidth: 1, borderColor: '#cbd5e1', borderRadius: 8, padding: 10, marginBottom: 16, fontSize: 14 },
+  button: { backgroundColor: '#0070ba', padding: 14, borderRadius: 8, alignItems: 'center' },
+  buttonText: { color: '#fff', fontWeight: '700', fontSize: 15 },
+  successBox: { backgroundColor: '#ecfdf5', padding: 20, borderRadius: 12, borderWidth: 1, borderColor: '#a7f3d0', alignItems: 'center' },
+  successTitle: { fontSize: 18, fontWeight: '800', color: '#065f46', marginBottom: 8 },
+  successSub: { fontSize: 14, color: '#047857', textAlign: 'center', marginBottom: 16 },
 });

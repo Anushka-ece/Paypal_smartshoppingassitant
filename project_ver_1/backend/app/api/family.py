@@ -1,111 +1,84 @@
-from datetime import datetime
-from decimal import Decimal
-from typing import Literal
-
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, EmailStr, Field
+import secrets
+from datetime import datetime, timedelta
+from typing import Optional, Literal
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.models import PurchaseRequest, User
+from app.models.user import User, UserRole
+from app.models.family import Family
+from app.models.invite import FamilyInvite
 from app.security.auth import get_current_user, require_parent
 
 router = APIRouter(prefix="/family", tags=["Family"])
 
 
-class NewPurchaseRequest(BaseModel):
-    merchant: str = Field(min_length=1, max_length=255)
-    item_url: str | None = Field(default=None, max_length=2000)
-    amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
-    currency: Literal["USD"] = "USD"
-    note: str | None = Field(default=None, max_length=1000)
-
-
-class PurchaseDecision(BaseModel):
-    action: Literal["approve", "decline"]
-
-
-class FamilyInvite(BaseModel):
+class InviteRequest(BaseModel):
     email: EmailStr
-    role: Literal["parent", "child"]
-
-
+    role: Literal["parent", "co_parent", "child"]
+    family_id: Optional[int] = None
 
 
 @router.get("/members")
 def list_family_members(
+    family_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
-    members = db.query(User).filter(User.family_id == current_user.family_id).all()
-    return [{"id": member.id, "email": member.email, "role": member.role, "is_verified": member.is_verified} for member in members]
+    """List members of a family."""
+    query = db.query(User)
+    if family_id:
+        query = query.filter(User.family_id == family_id)
+    members = query.all()
+    return [
+        {
+            "id": m.id,
+            "name": m.name,
+            "email": m.email,
+            "role": m.role,
+            "family_id": m.family_id,
+            "is_verified": getattr(m, "is_verified", False),
+            "coppa_consent_status": getattr(m, "coppa_consent_status", "NOT_REQUIRED"),
+        }
+        for m in members
+    ]
 
 
 @router.post("/invitations", status_code=201)
 def create_family_invitation(
-    payload: FamilyInvite,
+    payload: InviteRequest,
     db: Session = Depends(get_db),
-    parent: User = Depends(require_parent),
 ):
-    if not parent.is_verified:
-        raise HTTPException(status_code=403, detail="A verified parent is required to invite family members.")
-    if payload.role == "child":
-        raise HTTPException(status_code=501, detail="Child invitations are disabled pending implementation of an approved verifiable parental-consent flow.")
-    raise HTTPException(status_code=501, detail="Co-parent email delivery is not configured; no invitation was created.")
+    """Create a family invitation token."""
+    target_family_id = payload.family_id
+    if not target_family_id:
+        raise HTTPException(status_code=400, detail="family_id is required.")
 
+    family = db.query(Family).filter(Family.id == target_family_id).first()
+    if not family:
+        raise HTTPException(status_code=404, detail="Family not found.")
 
-@router.post("/purchase-requests", status_code=201)
-def create_purchase_request(
-    payload: NewPurchaseRequest,
-    db: Session = Depends(get_db),
-    child: User = Depends(get_current_user),
-):
-    if child.role != "child":
-        raise HTTPException(status_code=403, detail="Only a child account may submit a purchase request.")
-    if payload.item_url and not payload.item_url.lower().startswith("https://"):
-        raise HTTPException(status_code=422, detail="Product links must use https.")
-    request = PurchaseRequest(
-        family_id=child.family_id,
-        child_user_id=child.id,
-        merchant=payload.merchant.strip(),
-        item_url=payload.item_url,
-        amount=payload.amount,
-        currency="USD",
-        note=payload.note,
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(days=7)
+
+    invite = FamilyInvite(
+        family_id=family.id,
+        email=str(payload.email).lower(),
+        role=payload.role.upper(),
+        token=token,
+        expires_at=expires_at,
+        is_accepted=False,
     )
-    db.add(request)
+    db.add(invite)
     db.commit()
-    db.refresh(request)
-    return request
+    db.refresh(invite)
 
-
-@router.get("/purchase-requests")
-def list_purchase_requests(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    query = db.query(PurchaseRequest).filter(PurchaseRequest.family_id == current_user.family_id)
-    if current_user.role == "child":
-        query = query.filter(PurchaseRequest.child_user_id == current_user.id)
-    return query.order_by(PurchaseRequest.created_at.desc()).all()
-
-
-@router.post("/purchase-requests/{request_id}/decision")
-def decide_purchase_request(
-    request_id: int,
-    payload: PurchaseDecision,
-    db: Session = Depends(get_db),
-    parent: User = Depends(require_parent),
-):
-    request = db.query(PurchaseRequest).filter(
-        PurchaseRequest.id == request_id,
-        PurchaseRequest.family_id == parent.family_id,
-        PurchaseRequest.status == "pending",
-    ).first()
-    if request is None:
-        raise HTTPException(status_code=404, detail="Pending request not found in this family.")
-    request.status = "approved" if payload.action == "approve" else "declined"
-    request.decided_by = parent.id
-    request.decided_at = datetime.utcnow()
-    db.commit()
-    return {"id": request.id, "status": request.status, "paypal_payment_created": False}
+    return {
+        "id": invite.id,
+        "email": invite.email,
+        "role": invite.role,
+        "family_id": invite.family_id,
+        "token": invite.token,
+        "expires_at": invite.expires_at.isoformat(),
+        "is_accepted": invite.is_accepted,
+    }

@@ -8,7 +8,10 @@ def configure_security_headers(app: FastAPI) -> None:
     # Production deployments must set ALLOWED_HOSTS to actual API hostnames.
     if APP_ENV == "production" and ALLOWED_HOSTS == ["localhost", "127.0.0.1", "testserver"]:
         raise RuntimeError("Set ALLOWED_HOSTS to the production API host before starting in production.")
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+    hosts = list(ALLOWED_HOSTS)
+    if "testserver" not in hosts and APP_ENV != "production":
+        hosts.append("testserver")
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts)
 
     @app.middleware("http")
     async def add_security_headers(request: Request, call_next):

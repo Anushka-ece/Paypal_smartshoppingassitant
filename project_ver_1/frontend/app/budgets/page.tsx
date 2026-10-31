@@ -1,50 +1,149 @@
-"use client";
+'use client';
 
-import { useEffect, useState } from "react";
-import { useSession } from "../hooks/use-session";
+import React, { useState } from 'react';
 
-const apiBase = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
-type Budget = { id: number; category_name: string; allocated_amount: string; spent_amount: string; currency: string };
+interface Envelope {
+  id: number;
+  name: string;
+  allocated: number;
+  spent: number;
+  currency: string;
+}
+
+interface BudgetItem {
+  id: number;
+  merchant: string;
+  category: string;
+  amount: number;
+  status: 'COMPLETED' | 'REFUNDED' | 'PARTIALLY_REFUNDED';
+  date: string;
+}
 
 export default function BudgetsPage() {
-  const { session, ready } = useSession();
-  const [category, setCategory] = useState("Free spend");
-  const [amount, setAmount] = useState("50.00");
-  const [notice, setNotice] = useState("Loading session…");
-  const [budgets, setBudgets] = useState<Budget[]>([]);
+  const [hideRefunded, setHideRefunded] = useState<boolean>(false);
 
-  async function load() {
-    if (!session?.token) { setNotice("Sign in from the overview first."); return; }
-    try {
-      const response = await fetch(`${apiBase}/allowances/`, { headers: { Authorization: `Bearer ${session.token}` } });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail ?? "Unable to load budgets.");
-      setBudgets(data);
-      setNotice(`Loaded ${data.length} budget envelope(s).`);
-    } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to reach the API."); }
-  }
-  useEffect(() => { if (ready) load(); }, [ready, session?.token]);
+  const [envelopes, setEnvelopes] = useState<Envelope[]>([
+    { id: 1, name: 'Gaming & In-App Purchases', allocated: 100.0, spent: 49.99, currency: 'USD' },
+    { id: 2, name: 'Food & Dining Out', allocated: 150.0, spent: 85.5, currency: 'USD' },
+    { id: 3, name: 'Transport & Rideshare', allocated: 80.0, spent: 32.0, currency: 'USD' },
+    { id: 4, name: 'Shopping & Apparel', allocated: 120.0, spent: 110.0, currency: 'USD' },
+  ]);
 
-  async function saveBudget() {
-    if (!session?.token || session.role !== "parent") { setNotice("A signed-in parent is required to manage budgets."); return; }
-    try {
-      const response = await fetch(`${apiBase}/allowances/budgets`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${session.token}` }, body: JSON.stringify({ category_name: category, allocated_amount: amount, currency: "USD" }) });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.detail ?? "Unable to save budget.");
-      setNotice(`${data.category_name} budget saved: $${Number(data.allocated_amount).toFixed(2)} USD.`);
-      await load();
-    } catch (error) { setNotice(error instanceof Error ? error.message : "Unable to connect to the API."); }
-  }
+  const [ledger, setLedger] = useState<BudgetItem[]>([
+    { id: 201, merchant: 'Steam Games', category: 'Gaming & In-App Purchases', amount: 49.99, status: 'COMPLETED', date: '2026-10-30' },
+    { id: 202, merchant: 'McDonalds', category: 'Food & Dining Out', amount: 14.50, status: 'COMPLETED', date: '2026-10-29' },
+    { id: 203, merchant: 'Target Store', category: 'Shopping & Apparel', amount: 65.00, status: 'REFUNDED', date: '2026-10-28' },
+    { id: 204, merchant: 'Uber *Trip', category: 'Transport & Rideshare', amount: 18.00, status: 'COMPLETED', date: '2026-10-28' },
+    { id: 205, merchant: 'Amazon Marketplace', category: 'Shopping & Apparel', amount: 45.00, status: 'PARTIALLY_REFUNDED', date: '2026-10-27' },
+  ]);
 
-  return <main style={{ maxWidth: 760, margin: "50px auto", padding: 24 }}>
-    <p style={{ color: "#75817b", fontSize: 12, letterSpacing: 1 }}>BUDGET PLANNING</p><h1 style={{ fontFamily: "Manrope, sans-serif" }}>Budget envelopes</h1>
-    <p style={{ color: "#75817b", lineHeight: 1.6 }}>Version 1 budgets use USD only. Envelopes track spending; they do not restrict PayPal checkout or represent cash balances.</p>
-    {session?.role === "parent" && <section style={{ display: "grid", gap: 12, background: "white", border: "1px solid #e7ece8", borderRadius: 16, padding: 22 }}>
-      <label>Envelope category<input value={category} onChange={(event) => setCategory(event.target.value)} style={{ display: "block", width: "100%", marginTop: 6, padding: 11, border: "1px solid #e7ece8", borderRadius: 9 }} /></label>
-      <label>Monthly allocation (USD)<input type="number" min="0" step="0.01" value={amount} onChange={(event) => setAmount(event.target.value)} style={{ display: "block", width: "100%", marginTop: 6, padding: 11, border: "1px solid #e7ece8", borderRadius: 9 }} /></label>
-      <button onClick={saveBudget} style={{ justifySelf: "start", background: "#006b52", color: "white", border: 0, borderRadius: 10, padding: "11px 16px", fontWeight: 700 }}>Save envelope</button>
-    </section>}
-    <section style={{ marginTop: 18, background: "white", border: "1px solid #e7ece8", borderRadius: 16, padding: 18 }}>{budgets.map((item) => { const allocated = Number(item.allocated_amount); const spent = Number(item.spent_amount); return <div key={item.id} style={{ padding: 12, borderBottom: "1px solid #eef1ee" }}><strong>{item.category_name}</strong><span style={{ float: "right" }}>${spent.toFixed(2)} / ${allocated.toFixed(2)} {item.currency}</span></div>; })}{!budgets.length && <p style={{ color: "#75817b" }}>No budget envelopes.</p>}</section>
-    <p role="status" style={{ color: "#75817b", fontSize: 13 }}>{notice}</p>
-  </main>;
+  const filteredLedger = hideRefunded
+    ? ledger.filter((item) => item.status === 'COMPLETED')
+    : ledger;
+
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem', flexWrap: 'wrap', gap: '1rem' }}>
+        <div>
+          <h2 style={{ fontSize: '1.8rem', margin: '0 0 0.25rem 0', color: '#003087' }}>Virtual Envelope Budgets</h2>
+          <p style={{ margin: 0, color: '#64748b', fontSize: '0.95rem' }}>
+            Allocated category balances with automated refund net-zero reconciliation.
+          </p>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', background: 'white', padding: '0.5rem 1rem', borderRadius: '0.5rem', border: '1px solid #cbd5e1' }}>
+          <input
+            id="hide-refund-toggle"
+            type="checkbox"
+            checked={hideRefunded}
+            onChange={(e) => setHideRefunded(e.target.checked)}
+            style={{ width: '1.1rem', height: '1.1rem', cursor: 'pointer' }}
+          />
+          <label htmlFor="hide-refund-toggle" style={{ fontSize: '0.9rem', fontWeight: 600, cursor: 'pointer' }}>
+            Hide refunded transactions
+          </label>
+        </div>
+      </div>
+
+      {/* Progress Bars for Envelopes */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(270px, 1fr))', gap: '1.25rem', marginBottom: '2.5rem' }}>
+        {envelopes.map((env) => {
+          const percent = Math.min(100, Math.round((env.spent / env.allocated) * 100));
+          const isWarning = percent >= 80;
+          return (
+            <div key={env.id} style={{ background: 'white', padding: '1.25rem', borderRadius: '0.5rem', border: '1px solid #e2e8f0' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, marginBottom: '0.5rem' }}>
+                <span>{env.name}</span>
+                <span style={{ color: isWarning ? '#ef4444' : '#10b981' }}>{percent}%</span>
+              </div>
+              <div style={{ background: '#f1f5f9', height: '10px', borderRadius: '5px', overflow: 'hidden', marginBottom: '0.75rem' }}>
+                <div
+                  style={{
+                    width: `${percent}%`,
+                    height: '100%',
+                    background: isWarning ? '#ef4444' : '#0070ba',
+                    borderRadius: '5px',
+                    transition: 'width 0.3s ease',
+                  }}
+                />
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.85rem', color: '#64748b' }}>
+                <span>Spent: ${env.spent.toFixed(2)}</span>
+                <span>Limit: ${env.allocated.toFixed(2)}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Category Transactions Ledger Table */}
+      <h3 style={{ fontSize: '1.3rem', color: '#003087', marginBottom: '1rem' }}>Envelope Transaction Ledger</h3>
+      <div style={{ background: 'white', borderRadius: '0.5rem', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
+        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.95rem' }}>
+          <thead>
+            <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
+              <th style={{ padding: '0.75rem 1rem' }}>Date</th>
+              <th style={{ padding: '0.75rem 1rem' }}>Merchant</th>
+              <th style={{ padding: '0.75rem 1rem' }}>Envelope</th>
+              <th style={{ padding: '0.75rem 1rem' }}>Amount</th>
+              <th style={{ padding: '0.75rem 1rem' }}>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filteredLedger.map((item) => (
+              <tr key={item.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
+                <td style={{ padding: '0.75rem 1rem', color: '#64748b' }}>{item.date}</td>
+                <td style={{ padding: '0.75rem 1rem', fontWeight: 600 }}>{item.merchant}</td>
+                <td style={{ padding: '0.75rem 1rem' }}>{item.category}</td>
+                <td style={{ padding: '0.75rem 1rem', fontWeight: 700 }}>${item.amount.toFixed(2)}</td>
+                <td style={{ padding: '0.75rem 1rem' }}>
+                  <span
+                    style={{
+                      padding: '0.2rem 0.5rem',
+                      borderRadius: '0.25rem',
+                      fontSize: '0.8rem',
+                      fontWeight: 600,
+                      background:
+                        item.status === 'COMPLETED'
+                          ? '#dcfce7'
+                          : item.status === 'REFUNDED'
+                          ? '#f1f5f9'
+                          : '#fef3c7',
+                      color:
+                        item.status === 'COMPLETED'
+                          ? '#15803d'
+                          : item.status === 'REFUNDED'
+                          ? '#64748b'
+                          : '#b45309',
+                    }}
+                  >
+                    {item.status}
+                  </span>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
 }

@@ -1,0 +1,11 @@
+.superpowers/
+__pycache__/
+*.pyc
+.env
+venv/
+node_modules/
+.DS_Store
+*.db
+*.sqlite
+*.sqlite3
+

@@ -1,82 +1,125 @@
+import logging
+from typing import List, Optional
 from datetime import datetime
-from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.models import AllowanceSchedule, Transaction, User
-from app.security.auth import get_current_user, require_parent
+from app.models.account import Account
+from app.models.transaction import Transaction
+from app.services.embedding_service import Tier1Classifier
+
+logger = logging.getLogger(__name__)
+
+tier1_classifier = Tier1Classifier()
 
 router = APIRouter(prefix="/transactions", tags=["Transactions & LLM Categorization"])
 
 
-class TransactionDecision(BaseModel):
-    action: Literal["approve", "review", "freeze_allowance"]
+class ReclassifyRequest(BaseModel):
+    category: str
+    subcategory: Optional[str] = None
+    merchant_clean_name: Optional[str] = None
+    notes: Optional[str] = None
 
 
-@router.get("/")
+class TransactionResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    account_id: int
+    paypal_transaction_id: Optional[str] = None
+    amount: float
+    currency: str
+    status: str
+    merchant_name: Optional[str] = None
+    clean_merchant_name: Optional[str] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
+    description: Optional[str] = None
+    risk_level: Optional[str] = None
+    is_flagged: bool = False
+    flagged_reason: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+@router.get("", response_model=List[TransactionResponse])
+@router.get("/", response_model=List[TransactionResponse])
 def get_transactions(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    account_id: Optional[int] = Query(None),
+    family_id: Optional[int] = Query(None),
+    category: Optional[str] = Query(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
-    """List family transactions for parents or only the caller's own transactions for children."""
-    query = db.query(Transaction).filter(Transaction.family_id == current_user.family_id)
-    if current_user.role == "child":
-        query = query.filter(Transaction.user_id == current_user.id)
-    return query.order_by(Transaction.created_at.desc()).all()
+    """
+    List transactions with filtering by account_id, family_id, and category.
+    """
+    query = db.query(Transaction)
 
+    if family_id is not None:
+        query = query.join(Account, Transaction.account_id == Account.id).filter(
+            Account.family_id == family_id
+        )
 
-@router.post("/sync-paypal", status_code=501)
-def sync_paypal_transactions(parent: User = Depends(require_parent)):
-    """Blocked until PayPal reporting permissions and per-family account ownership are established."""
-    raise HTTPException(
-        status_code=501,
-        detail=(
-            "Transaction Search uses app-level reporting access and can expose merchant-account records; "
-            "it is not a consumer wallet history endpoint. Configure approved PayPal reporting permissions "
-            "and a verified account-ownership mapping before enabling sync."
-        ),
+    if account_id is not None:
+        query = query.filter(Transaction.account_id == account_id)
+
+    if category is not None:
+        query = query.filter(Transaction.category == category)
+
+    transactions = (
+        query.order_by(Transaction.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
     )
+    return transactions
 
 
-@router.post("/{transaction_id}/decision")
-def decide_transaction(
+@router.post("/{transaction_id}/reclassify", response_model=TransactionResponse)
+def reclassify_transaction(
     transaction_id: int,
-    payload: TransactionDecision,
+    payload: ReclassifyRequest,
     db: Session = Depends(get_db),
-    parent: User = Depends(require_parent),
 ):
-    transaction = db.query(Transaction).filter(
-        Transaction.id == transaction_id,
-        Transaction.family_id == parent.family_id,
-    ).first()
-    if not parent.is_verified:
-        raise HTTPException(status_code=403, detail="A verified parent is required to decide transaction reviews.")
-    if transaction is None:
-        raise HTTPException(status_code=404, detail="Transaction not found in this family.")
-    if payload.action == "freeze_allowance":
-        db.query(AllowanceSchedule).filter(
-            AllowanceSchedule.family_id == parent.family_id,
-            AllowanceSchedule.active.is_(True),
-        ).update({AllowanceSchedule.active: False}, synchronize_session=False)
-        transaction.review_decision = "allowances_frozen"
-    elif payload.action == "approve":
-        transaction.is_flagged = False
-        transaction.status = "approved"
-        transaction.review_decision = "approved"
-        transaction.reviewed_by = parent.id
-        transaction.reviewed_at = datetime.utcnow()
-    else:
-        transaction.status = "under_review"
-        transaction.review_decision = "review_requested"
-        transaction.reviewed_by = parent.id
-        transaction.reviewed_at = datetime.utcnow()
+    """
+    Reclassifies an expense and persists the custom override into the family learning cache.
+    """
+    tx = db.query(Transaction).filter(Transaction.id == transaction_id).first()
+    if not tx:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Transaction {transaction_id} not found",
+        )
+
+    # 1. Update database transaction record
+    tx.category = payload.category
+    if payload.subcategory is not None:
+        tx.subcategory = payload.subcategory
+    if payload.merchant_clean_name is not None:
+        tx.clean_merchant_name = payload.merchant_clean_name
+
     db.commit()
-    return {
-        "status": "updated",
-        "action": payload.action,
-        "paypal_payment_changed": False,
-        "message": "This updates the family app only; captured PayPal payments must be managed through PayPal.",
-    }
+    db.refresh(tx)
+
+    # 2. Persist custom override in family learning cache
+    account = db.query(Account).filter(Account.id == tx.account_id).first()
+    family_id = account.family_id if account else None
+
+    merchant_to_learn = tx.merchant_name or tx.clean_merchant_name
+    if family_id and merchant_to_learn:
+        tier1_classifier.save_family_override(
+            family_id=family_id,
+            merchant_name=merchant_to_learn,
+            category=payload.category,
+            subcategory=payload.subcategory,
+            merchant_clean_name=payload.merchant_clean_name or tx.clean_merchant_name,
+            notes=payload.notes,
+        )
+
+    return tx

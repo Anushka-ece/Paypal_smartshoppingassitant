@@ -1,194 +1,361 @@
-from decimal import Decimal, InvalidOperation
-
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.exc import IntegrityError
+import json
+import logging
+from typing import Optional, Dict, Any
+from fastapi import APIRouter, Request, HTTPException, Depends
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+import redis
 
-from app.config import PAYPAL_WEBHOOK_ID
 from app.database import get_db
-from app.models.models import BudgetEnvelope, Family, LedgerEntry, PolicyRule, Transaction, User, WebhookEvent
-from app.services.gemini_service import classify_transaction, evaluate_policy
-from app.services.paypal_service import verify_webhook_signature
+from app.config import REDIS_URL
+from app.models.transaction import Transaction, TransactionStatus
+from app.models.account import Account
+from app.models.webhook_event import ProcessedWebhookEvent
+from app.services.paypal_service import PayPalService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/webhooks", tags=["PayPal Webhooks"])
-SUPPORTED_EVENTS = {"PAYMENT.CAPTURE.COMPLETED", "PAYMENT.CAPTURE.REFUNDED", "PAYMENT.SALE.REFUNDED", "CUSTOMER.DISPUTE.RESOLVED"}
+
+REQUIRED_HEADERS = [
+    "paypal-auth-algo",
+    "paypal-cert-url",
+    "paypal-transmission-id",
+    "paypal-transmission-sig",
+    "paypal-transmission-time",
+]
+
+_redis_client: Optional[redis.Redis] = None
+_redis_available: bool = True
 
 
-def _decimal_amount(value: object) -> Decimal:
+def get_redis_client() -> Optional[redis.Redis]:
+    global _redis_client, _redis_available
+    if not _redis_available:
+        return None
+    if _redis_client is None and REDIS_URL:
+        try:
+            client = redis.Redis.from_url(
+                REDIS_URL,
+                decode_responses=True,
+                socket_connect_timeout=0.2,
+                socket_timeout=0.2,
+                retry_on_timeout=False,
+            )
+            client.ping()
+            _redis_client = client
+        except Exception:
+            _redis_available = False
+            _redis_client = None
+    return _redis_client
+
+
+
+def get_paypal_service() -> PayPalService:
+    return PayPalService()
+
+
+def is_event_already_processed(event_id: str, db: Optional[Session] = None) -> bool:
+    """Checks Redis and PostgreSQL/SQLite for event deduplication."""
+    # 1. Check Redis cache
     try:
-        amount = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Invalid amount in PayPal event.") from exc
-    if not amount.is_finite() or amount <= 0:
-        raise HTTPException(status_code=400, detail="PayPal event amount must be positive and finite.")
-    return amount.quantize(Decimal("0.01"))
+        r = get_redis_client()
+        if r is not None:
+            if r.get(f"paypal:webhook:event:{event_id}"):
+                return True
+    except Exception:
+        pass
+
+    # 2. Check Database
+    if db is not None:
+        try:
+            exists = (
+                db.query(ProcessedWebhookEvent)
+                .filter(ProcessedWebhookEvent.event_id == event_id)
+                .first()
+            )
+            if exists:
+                return True
+        except Exception:
+            pass
+
+    return False
 
 
-def _resolve_family_user(custom_id: object, db: Session) -> tuple[Family, User] | None:
-    """Our checkout integration must set custom_id to `family_id:user_id`; never guess ownership."""
-    if not isinstance(custom_id, str) or ":" not in custom_id:
-        return None
+def record_processed_event(
+    event_id: str,
+    event_type: str,
+    status: str = "PROCESSED",
+    resource_type: Optional[str] = None,
+    resource_id: Optional[str] = None,
+    summary: Optional[str] = None,
+    db: Optional[Session] = None,
+) -> None:
+    """Records event in both Redis (with 24h TTL) and persistent Database."""
+    # 1. Cache in Redis
     try:
-        family_id, user_id = (int(value) for value in custom_id.split(":", maxsplit=1))
-    except ValueError:
-        return None
-    user = db.query(User).filter(User.id == user_id, User.family_id == family_id).first()
-    family = db.query(Family).filter(Family.id == family_id).first()
-    if user is None or family is None:
-        return None
-    return family, user
+        r = get_redis_client()
+        if r is not None:
+            r.set(f"paypal:webhook:event:{event_id}", status, ex=86400)
+    except Exception:
+        pass
+
+    # 2. Persist in Database
+    if db is not None:
+        try:
+            entry = ProcessedWebhookEvent(
+                event_id=event_id,
+                event_type=event_type,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                status=status,
+                summary=summary,
+            )
+            db.add(entry)
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+        except Exception as e:
+            logger.warning(f"Failed to persist webhook event record: {e}")
+            db.rollback()
 
 
-def _add_capture_ledger_entries(db: Session, transaction: Transaction) -> None:
-    amount = transaction.amount
-    category = transaction.category or "Uncategorized"
-    db.add_all([
-        LedgerEntry(transaction_id=transaction.id, account_code=f"expense:{category}", debit=amount, credit=Decimal("0.00")),
-        LedgerEntry(transaction_id=transaction.id, account_code="paypal:family-wallet", debit=Decimal("0.00"), credit=amount),
-    ])
+def handle_capture_completed(
+    resource: Dict[str, Any],
+    event: Dict[str, Any],
+    db: Optional[Session] = None,
+) -> Dict[str, Any]:
+    """Handles PAYMENT.CAPTURE.COMPLETED events and records transactions."""
+    capture_id = resource.get("id")
+    amount_info = resource.get("amount", {})
+    amount = float(amount_info.get("value", 0.0))
+    currency = amount_info.get("currency_code", "USD")
+    parent_payment = resource.get("parent_payment")
+    merchant_name = (
+        resource.get("seller_receivable_breakdown", {}).get("merchant_name")
+        or resource.get("payee", {}).get("email_address")
+        or "PayPal Merchant"
+    )
+    summary = event.get("summary") or "Payment capture completed"
+
+    tx = None
+    if db is not None:
+        # Find matching account
+        account = None
+        custom_id = resource.get("custom_id")
+        if custom_id and str(custom_id).isdigit():
+            account = db.query(Account).filter_by(id=int(custom_id)).first()
+
+        if not account:
+            payee_id = resource.get("payee", {}).get("merchant_id")
+            if payee_id:
+                account = db.query(Account).filter_by(paypal_account_id=payee_id).first()
+
+        if not account:
+            account = db.query(Account).first()
+
+        # Check existing transaction
+        if capture_id:
+            tx = db.query(Transaction).filter_by(paypal_transaction_id=capture_id).first()
+
+        if not tx and account:
+            tx = Transaction(
+                account_id=account.id,
+                paypal_transaction_id=capture_id,
+                amount=amount,
+                currency=currency,
+                status=TransactionStatus.COMPLETED.value,
+                merchant_name=merchant_name,
+                parent_payment_id=parent_payment,
+                description=summary,
+            )
+            db.add(tx)
+            db.commit()
+            db.refresh(tx)
+
+    return {
+        "action": "capture_processed",
+        "capture_id": capture_id,
+        "amount": amount,
+        "currency": currency,
+        "transaction_id": tx.id if tx else None,
+    }
+
+
+def handle_refund(
+    resource: Dict[str, Any],
+    event: Dict[str, Any],
+    db: Optional[Session] = None,
+) -> Dict[str, Any]:
+    """Handles PAYMENT.CAPTURE.REFUNDED and PAYMENT.SALE.REFUNDED events."""
+    refund_id = resource.get("id")
+    amount_info = resource.get("amount", {})
+    refund_amount = float(amount_info.get("value", 0.0))
+    parent_id = (
+        resource.get("parent_payment")
+        or resource.get("capture_id")
+        or resource.get("sale_id")
+    )
+
+    tx = None
+    new_status = "REFUNDED"
+    if db is not None:
+        from app.api.budgets import reconcile_refund
+        # Ensure parent_payment_id is populated on resource if present under alias
+        if not resource.get("parent_payment_id") and parent_id:
+            resource["parent_payment_id"] = parent_id
+        reconcile_res = reconcile_refund(resource, db=db)
+        if parent_id:
+            tx = (
+                db.query(Transaction)
+                .filter(
+                    (Transaction.paypal_transaction_id == parent_id)
+                    | (Transaction.parent_payment_id == parent_id)
+                )
+                .first()
+            )
+            if tx:
+                new_status = tx.status
+
+    return {
+        "action": "refund_reconciled",
+        "refund_id": refund_id,
+        "transaction_id": tx.id if tx else None,
+        "status": new_status,
+    }
+
+
+def handle_dispute_resolved(
+    resource: Dict[str, Any],
+    event: Dict[str, Any],
+    db: Optional[Session] = None,
+) -> Dict[str, Any]:
+    """Handles CUSTOMER.DISPUTE.RESOLVED events."""
+    dispute_id = resource.get("dispute_id")
+    disputed_transactions = resource.get("disputed_transactions", [])
+    outcome = resource.get("dispute_outcome", {}).get("outcome_code", "RESOLVED")
+
+    updated_tx_ids = []
+    if db is not None:
+        for item in disputed_transactions:
+            seller_tx_id = item.get("seller_transaction_id")
+            if seller_tx_id:
+                tx = (
+                    db.query(Transaction)
+                    .filter_by(paypal_transaction_id=seller_tx_id)
+                    .first()
+                )
+                if tx:
+                    tx.status = TransactionStatus.DISPUTED.value
+                    tx.is_flagged = True
+                    tx.flagged_reason = f"Dispute {dispute_id} resolved: {outcome}"
+                    db.commit()
+                    updated_tx_ids.append(tx.id)
+
+    return {
+        "action": "dispute_resolved",
+        "dispute_id": dispute_id,
+        "status": "RESOLVED",
+        "updated_transactions": updated_tx_ids,
+    }
+
+
+def route_webhook_event(
+    event: Dict[str, Any],
+    db: Optional[Session] = None,
+) -> Dict[str, Any]:
+    """Routes supported PayPal webhook events to appropriate handlers."""
+    event_type = event.get("event_type")
+    resource = event.get("resource", {})
+
+    if event_type == "PAYMENT.CAPTURE.COMPLETED":
+        return handle_capture_completed(resource, event, db=db)
+    elif event_type in ("PAYMENT.CAPTURE.REFUNDED", "PAYMENT.SALE.REFUNDED"):
+        return handle_refund(resource, event, db=db)
+    elif event_type == "CUSTOMER.DISPUTE.RESOLVED":
+        return handle_dispute_resolved(resource, event, db=db)
+    else:
+        return {"action": "unhandled", "event_type": event_type}
 
 
 @router.post("/paypal")
-async def handle_paypal_webhook(request: Request, db: Session = Depends(get_db)):
-    """Verify and process PayPal's at-least-once webhook delivery."""
-    if not PAYPAL_WEBHOOK_ID:
-        raise HTTPException(status_code=503, detail="PAYPAL_WEBHOOK_ID is required before accepting PayPal webhooks.")
-    body = await request.json()
-    if not verify_webhook_signature(dict(request.headers), body, PAYPAL_WEBHOOK_ID):
-        raise HTTPException(status_code=400, detail="PayPal webhook signature verification failed.")
+async def handle_paypal_webhook(
+    request: Request,
+    db: Session = Depends(get_db),
+    service: PayPalService = Depends(get_paypal_service),
+):
+    body_bytes = await request.body()
+    headers_lower = {str(k).lower(): str(v) for k, v in request.headers.items()}
 
-    event_id = body.get("id")
-    event_type = body.get("event_type")
-    if not isinstance(event_id, str) or not event_id:
-        raise HTTPException(status_code=400, detail="PayPal webhook event is missing its id.")
-    existing = db.query(WebhookEvent).filter(WebhookEvent.paypal_event_id == event_id).first()
-    if existing:
-        return {"status": "duplicate", "event_id": event_id}
+    # 1. Header Validation
+    missing_headers = [h for h in REQUIRED_HEADERS if not headers_lower.get(h)]
+    if missing_headers:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required PayPal signature headers: {', '.join(missing_headers)}",
+        )
 
-    event = WebhookEvent(paypal_event_id=event_id, event_type=str(event_type or "unknown"))
-    db.add(event)
+    # 2. Signature Verification
+    is_valid = await service.verify_webhook_signature(headers_lower, body_bytes)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+
+    # 3. Parse JSON Body
     try:
-        db.flush()
-        resource = body.get("resource") or {}
-
-        if event_type == "PAYMENT.CAPTURE.COMPLETED":
-            capture_id = resource.get("id")
-            resolved = _resolve_family_user(resource.get("custom_id"), db)
-            if not isinstance(capture_id, str) or not capture_id:
-                raise HTTPException(status_code=400, detail="Capture event is missing the capture id.")
-            if resolved is None:
-                event.processing_status = "ignored_unmatched"
-                db.commit()
-                return {"status": "ignored", "reason": "Event has no valid application family/user custom_id."}
-            family, user = resolved
-            amount_data = resource.get("amount") or {}
-            currency = amount_data.get("currency_code")
-            if currency != "USD":
-                event.processing_status = "ignored_currency"
-                db.commit()
-                return {"status": "ignored", "reason": "Version 1 ledger supports USD only."}
-            amount = _decimal_amount(amount_data.get("value"))
-            payee = resource.get("payee") or {}
-            merchant_name = payee.get("email_address") or payee.get("merchant_id") or "Unknown merchant"
-            classification = classify_transaction(str(merchant_name), str(resource.get("description") or ""), float(amount))
-            rules = db.query(PolicyRule).filter(
-                PolicyRule.family_id == family.id,
-                PolicyRule.is_active.is_(True),
-            ).all()
-            policy_result = evaluate_policy(
-                [rule.rule_text for rule in rules],
-                {"merchant": merchant_name, "amount": str(amount), "category": classification.get("category"), "currency": currency},
-            )
-            transaction = Transaction(
-                family_id=family.id,
-                user_id=user.id,
-                paypal_transaction_id=capture_id,
-                merchant_name=str(merchant_name),
-                clean_merchant_name=classification.get("clean_name"),
-                amount=amount,
-                currency=currency,
-                category=classification.get("category"),
-                subcategory=classification.get("subcategory"),
-                status="flagged" if policy_result.get("is_flagged") else "completed",
-                is_flagged=bool(policy_result.get("is_flagged")),
-                risk_level=policy_result.get("risk_level", "LOW"),
-                matched_rules=policy_result.get("matched_rules", []),
-            )
-            db.add(transaction)
-            db.flush()
-            _add_capture_ledger_entries(db, transaction)
-            envelope = db.query(BudgetEnvelope).filter(
-                BudgetEnvelope.family_id == family.id,
-                BudgetEnvelope.user_id == user.id,
-                BudgetEnvelope.category_name == transaction.category,
-            ).first()
-            if envelope:
-                envelope.spent_amount = Decimal(envelope.spent_amount or 0) + amount
-
-        elif event_type in {"PAYMENT.CAPTURE.REFUNDED", "PAYMENT.SALE.REFUNDED"}:
-            resource_ids = (resource.get("supplementary_data") or {}).get("related_ids") or {}
-            capture_id = resource_ids.get("capture_id") or resource.get("capture_id")
-            if not capture_id:
-                event.processing_status = "ignored_unmatched"
-                db.commit()
-                return {"status": "ignored", "reason": "Refund does not identify its original capture."}
-            transaction = db.query(Transaction).filter(Transaction.paypal_transaction_id == capture_id).with_for_update().first()
-            if transaction is None:
-                event.processing_status = "ignored_unmatched"
-                db.commit()
-                return {"status": "ignored", "reason": "Original capture is not present in the application ledger."}
-            refund_amount = _decimal_amount((resource.get("amount") or {}).get("value"))
-            remaining = transaction.amount - Decimal(transaction.refunded_amount or 0)
-            applied = min(refund_amount, remaining)
-            if applied <= 0:
-                event.processing_status = "ignored_duplicate_refund"
-                db.commit()
-                return {"status": "ignored", "reason": "Capture was already fully refunded."}
-            transaction.refunded_amount = Decimal(transaction.refunded_amount or 0) + applied
-            transaction.status = "refunded" if transaction.refunded_amount >= transaction.amount else "partially_refunded"
-            # Reverse the original ledger effect with a new pair of immutable lines.
-            db.add_all([
-                LedgerEntry(transaction_id=transaction.id, account_code=f"expense:{transaction.category or 'Uncategorized'}", debit=Decimal("0.00"), credit=applied),
-                LedgerEntry(transaction_id=transaction.id, account_code="paypal:family-wallet", debit=applied, credit=Decimal("0.00")),
-            ])
-            envelope = db.query(BudgetEnvelope).filter(
-                BudgetEnvelope.family_id == transaction.family_id,
-                BudgetEnvelope.user_id == transaction.user_id,
-                BudgetEnvelope.category_name == transaction.category,
-            ).first()
-            if envelope:
-                envelope.spent_amount = max(Decimal("0.00"), Decimal(envelope.spent_amount or 0) - applied)
-
-        elif event_type == "CUSTOMER.DISPUTE.RESOLVED":
-            dispute_id = resource.get("dispute_id") or resource.get("id")
-            disputed_transactions = resource.get("disputed_transactions") or []
-            seller_transaction_id = next(
-                (item.get("seller_transaction_id") for item in disputed_transactions if item.get("seller_transaction_id")),
-                None,
-            )
-            transaction = db.query(Transaction).filter(
-                Transaction.paypal_transaction_id == seller_transaction_id,
-            ).with_for_update().first() if seller_transaction_id else None
-            if transaction is None:
-                event.processing_status = "ignored_unmatched"
-                db.commit()
-                return {"status": "ignored", "reason": "Dispute event does not map to a known application transaction."}
-            transaction.dispute_id = str(dispute_id) if dispute_id else None
-            transaction.dispute_status = str(resource.get("status", "RESOLVED"))
-            transaction.status = "dispute_resolved"
-
-        elif event_type not in SUPPORTED_EVENTS:
-            event.processing_status = "ignored_unsupported"
-            db.commit()
-            return {"status": "ignored", "event_type": event_type}
-
-        event.processing_status = "processed"
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        return {"status": "duplicate", "event_id": event_id}
+        payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
     except Exception:
-        db.rollback()
-        raise
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    return {"status": "processed", "event_id": event_id, "event_type": event_type}
+    event_id = payload.get("id") or headers_lower.get("paypal-transmission-id")
+    event_type = payload.get("event_type", "")
+    resource_type = payload.get("resource_type")
+    resource = payload.get("resource", {})
+    resource_id = resource.get("id")
+
+    # 4. Idempotency Deduplication Check
+    if event_id and is_event_already_processed(event_id, db=db):
+        return {
+            "status": "already_processed",
+            "event_id": event_id,
+            "message": "Duplicate event ignored",
+        }
+
+    # 5. Supported Event Filtering
+    if not service.is_event_supported(event_type):
+        if event_id:
+            record_processed_event(
+                event_id=event_id,
+                event_type=event_type,
+                status="IGNORED",
+                resource_type=resource_type,
+                resource_id=resource_id,
+                summary=payload.get("summary"),
+                db=db,
+            )
+        return {
+            "status": "ignored",
+            "event_id": event_id,
+            "message": f"Unsupported event type: {event_type}",
+        }
+
+    # 6. Route to Appropriate Handler
+    result = route_webhook_event(payload, db=db)
+
+    # 7. Record as Processed
+    if event_id:
+        record_processed_event(
+            event_id=event_id,
+            event_type=event_type,
+            status="PROCESSED",
+            resource_type=resource_type,
+            resource_id=resource_id,
+            summary=payload.get("summary"),
+            db=db,
+        )
+
+    return {
+        "status": "processed",
+        "event_id": event_id,
+        "event_type": event_type,
+        "result": result,
+    }
