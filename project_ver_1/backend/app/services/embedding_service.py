@@ -284,7 +284,7 @@ class Tier1Classifier:
 
         # Check partial/contains match in memory cache (e.g. "Local Boba Cafe #2" vs "localbobacafe")
         for stored_key, data in fam_cache.items():
-            if stored_key in norm_key or norm_key in stored_key:
+            if stored_key in norm_key or (len(norm_key) >= 4 and norm_key in stored_key):
                 return data
 
         # 2. Check Redis cache
@@ -303,7 +303,7 @@ class Tier1Classifier:
                 # Check all keys in redis hash for partial match
                 all_overrides = redis_client.hgetall(redis_key)
                 for k, v in all_overrides.items():
-                    if k in norm_key or norm_key in k:
+                    if k in norm_key or (len(norm_key) >= 4 and norm_key in k):
                         data = json.loads(v)
                         if family_id not in self._in_memory_family_overrides:
                             self._in_memory_family_overrides[family_id] = {}

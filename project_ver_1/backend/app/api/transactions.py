@@ -9,9 +9,11 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.account import Account
 from app.models.transaction import Transaction
-from app.services.gemini_service import tier1_classifier
+from app.services.embedding_service import Tier1Classifier
 
 logger = logging.getLogger(__name__)
+
+tier1_classifier = Tier1Classifier()
 
 router = APIRouter(prefix="/transactions", tags=["Transactions & LLM Categorization"])
 
