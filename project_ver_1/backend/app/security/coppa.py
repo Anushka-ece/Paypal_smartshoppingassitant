@@ -73,3 +73,23 @@ def verify_parental_consent(
         "verified_at": datetime.utcnow().isoformat(),
         "method": "PAYPAL_OAUTH_PAYMENT_METHOD_VERIFICATION",
     }
+
+
+def require_verified_parent(parent: User) -> None:
+    """Require verified adult account before actions affecting a minor's data or money."""
+    from fastapi import HTTPException
+    role = str(parent.role).upper()
+    if role not in [UserRole.PARENT.value, UserRole.CO_PARENT.value] or not parent.is_verified:
+        raise HTTPException(status_code=403, detail="Verified parent/guardian authorization is required.")
+
+
+def grant_parental_consent(db: Session, parent: User) -> None:
+    """Record that a parent completed verified consent."""
+    require_verified_parent(parent)
+    parent.is_verified = True
+    db.add(parent)
+    db.commit()
+
+
+def consent_audit_record(parent_id: int) -> dict:
+    return {"actor_parent_id": parent_id, "recorded_at": datetime.utcnow().isoformat() + "Z"}

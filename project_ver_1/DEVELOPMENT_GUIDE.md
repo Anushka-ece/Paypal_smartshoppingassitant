@@ -203,3 +203,19 @@ All open design clarifications have been resolved for version 1:
 4. **COPPA Compliance**: FTC-compliant Verifiable Parental Consent (VPC) via parent email verification and secure OAuth parental authorization.
 5. **Real-Time Strategy**: Hybrid model combining Pre-Purchase Request Mode (Pocket Money / In-App Store Approvals via PayPal Vault & Payouts) and Post-Capture Guardrails (instant webhooks within 1.5s).
 6. **Audit Integrity**: Double-entry ledger with TimescaleDB; refunds update original debit entries to `REFUNDED` or `PARTIALLY_REFUNDED` without hard-deleting transactions.
+
+---
+
+## 4. Implementation Guardrails and Verified PayPal Boundaries
+
+Subagents and contributors must preserve these safety and integration boundaries:
+
+1. **PayPal checkout is not controlled by this app**: `PAYMENT.CAPTURE.COMPLETED` arrives after capture. Do not describe a webhook action as a checkout authorization, reversal, or automatic dispute. Request workflows are application records only unless a separately approved PayPal order/funding flow is implemented.
+2. **Transaction Search is app reporting access**: Do not assume an OpenID consent token grants personal transaction-history access. Keep sync disabled until PayPal approves the reporting API for the application's account type and a reviewed mapping proves which source data belongs to which family. Reporting may lag several hours; use webhooks for event notifications.
+3. **Money movement must be explicit**: Payouts are implemented through PayPal Payouts v1, but `PAYPAL_PAYOUTS_ENABLED` defaults to false. Never enable it outside a verified Sandbox test without human operator review. Reuse a stable `sender_batch_id` on retry and respect PayPal's documented 30-day duplicate protection.
+4. **Webhook security**: Require a configured PayPal webhook ID and successful signature verification. Store the event ID before processing and handle duplicate delivery idempotently. Never use hard-coded family/user IDs; require a verified ownership mapping and ignore unmatched transactions.
+5. **Account data security**: Keep PayPal tokens encrypted at rest; do not log tokens, OAuth callback query values, invitation credentials, or child data. A token-encryption key is required to link accounts. Never return credentials in API responses.
+6. **Parent/child compliance**: Parent signup is pending verification by default. Child profile creation and email invitation delivery remain disabled until a real verifiable parental-consent process and secure identity verification are implemented and reviewed. Do not treat email verification alone as COPPA consent.
+7. **Finance values**: Use `Decimal`/fixed-precision numeric database columns for amounts, and USD only in v1. Keep the ledger immutable: refunds and dispute outcomes append/reconcile entries instead of deleting records.
+8. **LLM fail-safe**: Treat merchant descriptions and notes as untrusted input. Validate generated structured output; after retries or slow responses use deterministic classification. If a parent policy cannot be safely evaluated, flag for human review rather than silently passing.
+9. **Testing**: Test PayPal request payloads with mocks and Sandbox only; never run tests that initiate real transfers. Include webhook signature failures, duplicate delivery, refund/partial-refund accounting, role authorization and unauthenticated access.

@@ -5,15 +5,26 @@ import EnvelopesScreen from '../screens/EnvelopesScreen';
 import PurchaseRequestScreen from '../screens/PurchaseRequestScreen';
 import ReviewActionScreen from '../screens/ReviewActionScreen';
 import ParentAlertModal from '../screens/ParentAlertModal';
+import LoginScreen from '../screens/LoginScreen';
 
 export default function AppNavigator() {
   const [currentTab, setCurrentTab] = useState('Home');
   const [role, setRole] = useState('PARENT');
+  const [authToken, setAuthToken] = useState(null);
+  const [showLogin, setShowLogin] = useState(false);
   const [alertVisible, setAlertVisible] = useState(false);
   const [activeAlert, setActiveAlert] = useState(null);
 
   const toggleRole = () => {
     setRole((prev) => (prev === 'PARENT' ? 'CHILD' : 'PARENT'));
+  };
+
+  const handleLogin = (token, userRole) => {
+    setAuthToken(token);
+    if (userRole) {
+      setRole(userRole.toUpperCase());
+    }
+    setShowLogin(false);
   };
 
   const triggerTestAlert = () => {
@@ -32,6 +43,17 @@ export default function AppNavigator() {
     setAlertVisible(false);
     alert(`Action ${action} executed for ${alertData.merchant}`);
   };
+
+  if (showLogin) {
+    return (
+      <View style={styles.container}>
+        <LoginScreen onLogin={handleLogin} />
+        <TouchableOpacity style={styles.backBtn} onPress={() => setShowLogin(false)}>
+          <Text style={styles.backBtnText}>← Back to App (Demo Mode)</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>
@@ -70,6 +92,9 @@ export default function AppNavigator() {
         <TouchableOpacity style={styles.navItem} onPress={() => setCurrentTab('Review')}>
           <Text style={[styles.navText, currentTab === 'Review' && styles.activeNavText]}>📝 Explain</Text>
         </TouchableOpacity>
+        <TouchableOpacity style={styles.navItem} onPress={() => setShowLogin(true)}>
+          <Text style={[styles.navText, showLogin && styles.activeNavText]}>🔐 Auth</Text>
+        </TouchableOpacity>
       </View>
     </View>
   );
@@ -78,6 +103,8 @@ export default function AppNavigator() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f8fafc' },
   screenContainer: { flex: 1, paddingTop: 40 },
+  backBtn: { padding: 12, alignItems: 'center', backgroundColor: '#e2e8f0' },
+  backBtnText: { color: '#334155', fontWeight: '600' },
   navBar: {
     flexDirection: 'row',
     height: 60,

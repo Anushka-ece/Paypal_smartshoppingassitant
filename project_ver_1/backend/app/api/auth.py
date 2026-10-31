@@ -1,17 +1,20 @@
 import json
 import logging
 import urllib.parse
+from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, status
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
 import httpx
 
 from app.database import get_db
-from app.models.user import User
+from app.models.user import User, UserRole
+from app.models.family import Family
 from app.models.account import Account, AccountType
 from app.services.paypal_service import PayPalService
 from app.security.crypto import encrypt_token
+from app.security.auth import create_access_token, hash_password, verify_password
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +23,71 @@ router = APIRouter(prefix="/auth", tags=["Authentication & PayPal OAuth"])
 
 def get_paypal_service() -> PayPalService:
     return PayPalService()
+
+
+class ParentRegistration(BaseModel):
+    family_name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+@router.post("/register", status_code=201)
+def register_parent(payload: ParentRegistration, db: Session = Depends(get_db)):
+    """Create an initial family and parent account."""
+    normalized_email = str(payload.email).lower()
+    if db.query(User).filter(User.email == normalized_email).first():
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+    family = Family(name=payload.family_name.strip())
+    db.add(family)
+    db.flush()
+    parent = User(
+        family_id=family.id,
+        email=normalized_email,
+        name=normalized_email.split("@")[0],
+        hashed_password=hash_password(payload.password),
+        role=UserRole.PARENT.value,
+        is_verified=False,
+    )
+    db.add(parent)
+    db.commit()
+    db.refresh(parent)
+    family.created_by_user_id = parent.id
+    db.commit()
+    return {"status": "pending_verification", "user_id": parent.id, "family_id": family.id}
+
+
+@router.post("/login")
+def login(payload: LoginRequest, db: Session = Depends(get_db)):
+    normalized_email = str(payload.email).lower()
+    user = db.query(User).filter(User.email == normalized_email).first()
+    now = datetime.utcnow()
+    if user is None:
+        verify_password(payload.password, "scrypt$16384$8$1$00112233445566778899aabbccddeeff$" + "00" * 64)
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    if user.locked_until and user.locked_until > now:
+        raise HTTPException(status_code=429, detail="Too many attempts. Try again later.")
+    if not verify_password(payload.password, user.hashed_password):
+        user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
+        if user.failed_login_attempts >= 5:
+            user.failed_login_attempts = 0
+            user.locked_until = now + timedelta(minutes=15)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    db.commit()
+    return {
+        "access_token": create_access_token(user),
+        "token_type": "bearer",
+        "role": user.role,
+        "user_id": user.id,
+        "family_id": user.family_id,
+    }
 
 
 class CallbackPayload(BaseModel):

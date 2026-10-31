@@ -371,3 +371,88 @@ def test_api_callback_user_not_found(db_session):
             assert "User with ID 999999 not found" in res.json()["detail"]
     finally:
         app.dependency_overrides.pop(get_db, None)
+
+
+# ----------------------------------------------------------------------
+# 5. User Registration, Scrypt Password Auth & JWT Login Tests
+# ----------------------------------------------------------------------
+
+def test_parent_registration_and_login_flow(db_session):
+    app.dependency_overrides[get_db] = lambda: db_session
+    try:
+        # Register new parent
+        reg_payload = {
+            "family_name": "Simpson Family",
+            "email": "marge@example.com",
+            "password": "SuperSecretPassword123",
+        }
+        res = client.post("/api/auth/register", json=reg_payload)
+        assert res.status_code == 201
+        data = res.json()
+        assert data["status"] == "pending_verification"
+        assert "user_id" in data
+        assert "family_id" in data
+
+        # Login with correct password
+        login_res = client.post(
+            "/api/auth/login",
+            json={"email": "marge@example.com", "password": "SuperSecretPassword123"},
+        )
+        assert login_res.status_code == 200
+        token_data = login_res.json()
+        assert "access_token" in token_data
+        assert token_data["token_type"] == "bearer"
+        assert token_data["role"] == UserRole.PARENT.value
+
+        # Login with wrong password
+        fail_res = client.post(
+            "/api/auth/login",
+            json={"email": "marge@example.com", "password": "WrongPassword123"},
+        )
+        assert fail_res.status_code == 401
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_login_lockout_after_five_failed_attempts(db_session):
+    app.dependency_overrides[get_db] = lambda: db_session
+    try:
+        client.post(
+            "/api/auth/register",
+            json={"family_name": "Lockout Test", "email": "homer@example.com", "password": "Password12345"},
+        )
+        for _ in range(5):
+            res = client.post(
+                "/api/auth/login",
+                json={"email": "homer@example.com", "password": "WrongPassword!"},
+            )
+            assert res.status_code == 401
+
+        # 6th attempt should be locked out with 429
+        locked_res = client.post(
+            "/api/auth/login",
+            json={"email": "homer@example.com", "password": "Password12345"},
+        )
+        assert locked_res.status_code == 429
+        assert "Too many attempts" in locked_res.json()["detail"]
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_registration_duplicate_email_rejected(db_session):
+    app.dependency_overrides[get_db] = lambda: db_session
+    try:
+        payload = {
+            "family_name": "Dup Family",
+            "email": "duplicate@example.com",
+            "password": "Password12345",
+        }
+        res1 = client.post("/api/auth/register", json=payload)
+        assert res1.status_code == 201
+
+        res2 = client.post("/api/auth/register", json=payload)
+        assert res2.status_code == 409
+        assert "already exists" in res2.json()["detail"]
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
