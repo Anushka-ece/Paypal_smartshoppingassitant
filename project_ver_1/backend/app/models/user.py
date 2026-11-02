@@ -25,6 +25,7 @@ class User(Base):
     is_verified = Column(Boolean, default=False, nullable=False)
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime, nullable=True)
+    auth_token_version = Column(Integer, default=0, nullable=False)
     coppa_consent_status = Column(String(50), default="NOT_REQUIRED", nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
@@ -41,6 +42,8 @@ class User(Base):
             kwargs["is_verified"] = False
         if "failed_login_attempts" not in kwargs:
             kwargs["failed_login_attempts"] = 0
+        if "auth_token_version" not in kwargs:
+            kwargs["auth_token_version"] = 0
         if "coppa_consent_status" not in kwargs:
             kwargs["coppa_consent_status"] = "NOT_REQUIRED"
         if "created_at" not in kwargs:

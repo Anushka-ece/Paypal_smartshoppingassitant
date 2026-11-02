@@ -1,7 +1,10 @@
 import logging
-from datetime import datetime
+import asyncio
+import concurrent.futures
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 from celery import Celery
+import httpx
 from sqlalchemy.orm import Session
 
 from app.config import REDIS_URL
@@ -11,8 +14,47 @@ from app.models.transaction import Transaction, TransactionStatus
 from app.models.ledger import LedgerEntry, LedgerStatus
 from app.services.paypal_service import PayPalService
 from app.security.crypto import decrypt_token
+from app.security.crypto import encrypt_token
 
 logger = logging.getLogger(__name__)
+
+
+def _run_async(coroutine):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(asyncio.run, coroutine).result()
+
+
+def _refresh_account_access_token(account: Account, db: Session, service: PayPalService) -> str:
+    if not account.paypal_encrypted_refresh_token:
+        raise ValueError("PayPal access token expired and no refresh token is available; reconnect the account.")
+    try:
+        refresh_token = decrypt_token(account.paypal_encrypted_refresh_token)
+    except ValueError as exc:
+        raise ValueError("Stored PayPal refresh token is invalid; reconnect the account.") from exc
+
+    refreshed = _run_async(service.refresh_access_token(refresh_token))
+    access_token = refreshed.get("access_token")
+    try:
+        expires_in = int(refreshed["expires_in"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("PayPal returned an invalid refreshed token lifetime.") from exc
+    if not isinstance(access_token, str) or not access_token or expires_in <= 0:
+        raise ValueError("PayPal returned an invalid refreshed access token.")
+
+    rotated_refresh_token = refreshed.get("refresh_token")
+    if rotated_refresh_token is not None:
+        if not isinstance(rotated_refresh_token, str) or not rotated_refresh_token:
+            raise ValueError("PayPal returned an invalid rotated refresh token.")
+        account.paypal_encrypted_refresh_token = encrypt_token(rotated_refresh_token)
+    account.paypal_encrypted_token = encrypt_token(access_token)
+    account.paypal_access_token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    db.commit()
+    return access_token
+
 
 celery_app = Celery("tasks", broker=REDIS_URL, backend=REDIS_URL)
 celery_app.conf.update(
@@ -44,7 +86,7 @@ def sync_historical_transactions_task(account_id: int, db: Optional[Session] = N
         should_close_db = True
 
     try:
-        account = db.query(Account).filter(Account.id == account_id).first()
+        account = db.query(Account).filter(Account.id == account_id).with_for_update().first()
         if not account:
             return {
                 "status": "error",
@@ -59,13 +101,65 @@ def sync_historical_transactions_task(account_id: int, db: Optional[Session] = N
         if account.paypal_encrypted_token:
             try:
                 token = decrypt_token(account.paypal_encrypted_token)
-            except Exception:
-                token = account.paypal_encrypted_token
-        token = token or "mock_access_token"
+            except ValueError:
+                logger.error("Stored PayPal access token cannot be decrypted for account %s", account_id)
+                return {
+                    "status": "error",
+                    "account_id": account_id,
+                    "message": "Stored PayPal access token is unavailable. Reconnect the PayPal account.",
+                    "synced_count": 0,
+                    "transaction_ids": [],
+                }
+        if not token:
+            return {
+                "status": "error",
+                "account_id": account_id,
+                "message": "PayPal account has no stored access or refresh token.",
+                "synced_count": 0,
+                "transaction_ids": [],
+            }
 
         service = PayPalService()
+        expires_at = account.paypal_access_token_expires_at
+        if expires_at is not None:
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= datetime.now(timezone.utc) + timedelta(seconds=60):
+                try:
+                    token = _refresh_account_access_token(account, db, service)
+                except Exception:
+                    logger.exception("PayPal access-token refresh failed for account %s", account_id)
+                    return {
+                        "status": "error",
+                        "account_id": account_id,
+                        "message": "PayPal access token could not be refreshed. Reconnect the PayPal account.",
+                        "synced_count": 0,
+                        "transaction_ids": [],
+                    }
         try:
             records = service.fetch_historical_transactions(access_token=token)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 401 or not account.paypal_encrypted_refresh_token:
+                logger.error("PayPal transaction history request failed for account %s", account_id)
+                return {
+                    "status": "error",
+                    "account_id": account_id,
+                    "message": "PayPal transaction history could not be retrieved.",
+                    "synced_count": 0,
+                    "transaction_ids": [],
+                }
+            try:
+                token = _refresh_account_access_token(account, db, service)
+                records = service.fetch_historical_transactions(access_token=token)
+            except Exception:
+                logger.exception("PayPal access-token refresh or retry failed for account %s", account_id)
+                return {
+                    "status": "error",
+                    "account_id": account_id,
+                    "message": "PayPal access token could not be refreshed. Reconnect the PayPal account.",
+                    "synced_count": 0,
+                    "transaction_ids": [],
+                }
         except Exception as e:
             logger.error(f"Failed to fetch historical transactions for account {account_id}: {e}")
             return {

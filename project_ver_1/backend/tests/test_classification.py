@@ -252,7 +252,8 @@ def test_api_get_transactions(db_session):
             clean_merchant_name="Uber",
             category="Transport",
             subcategory="Rideshare",
-            status=TransactionStatus.COMPLETED.value,
+            status=TransactionStatus.REFUNDED.value,
+            refund_id="REFUND-1001",
         )
         tx2 = Transaction(
             account_id=account.id,
@@ -274,6 +275,9 @@ def test_api_get_transactions(db_session):
         tx_ids = [tx["paypal_transaction_id"] for tx in data]
         assert "TX-1001" in tx_ids
         assert "TX-1002" in tx_ids
+        refunded_transaction = next(tx for tx in data if tx["paypal_transaction_id"] == "TX-1001")
+        assert refunded_transaction["status"] == TransactionStatus.REFUNDED.value
+        assert refunded_transaction["refund_id"] == "REFUND-1001"
     finally:
         app.dependency_overrides.pop(get_db, None)
 
@@ -347,4 +351,3 @@ def test_api_reclassify_not_found(db_session):
         assert "not found" in response.json()["detail"].lower()
     finally:
         app.dependency_overrides.pop(get_db, None)
-

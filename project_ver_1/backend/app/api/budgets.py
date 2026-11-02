@@ -10,6 +10,8 @@ from app.database import get_db
 from app.models.account import Account
 from app.models.budget import BudgetEnvelope
 from app.models.transaction import Transaction, TransactionStatus
+from app.models.user import User
+from app.security.auth import get_current_user, require_family_member, require_family_parent
 
 logger = logging.getLogger(__name__)
 
@@ -118,8 +120,13 @@ class EnvelopeResponse(BaseModel):
 
 
 @router.get("/envelopes", response_model=List[EnvelopeResponse])
-def list_envelopes(family_id: int = Query(...), db: Session = Depends(get_db)):
+def list_envelopes(
+    family_id: int = Query(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """List virtual budget envelopes for a family."""
+    require_family_member(current_user, family_id)
     envelopes = (
         db.query(BudgetEnvelope)
         .filter(BudgetEnvelope.family_id == family_id)
@@ -129,8 +136,13 @@ def list_envelopes(family_id: int = Query(...), db: Session = Depends(get_db)):
 
 
 @router.post("/envelopes", response_model=EnvelopeResponse)
-def create_envelope(payload: EnvelopeCreate, db: Session = Depends(get_db)):
+def create_envelope(
+    payload: EnvelopeCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Create a new virtual budget envelope."""
+    require_family_parent(current_user, payload.family_id)
     envelope = BudgetEnvelope(
         family_id=payload.family_id,
         name=payload.name.strip(),
@@ -146,15 +158,23 @@ def create_envelope(payload: EnvelopeCreate, db: Session = Depends(get_db)):
 
 @router.put("/envelopes/{envelope_id}", response_model=EnvelopeResponse)
 def update_envelope(
-    envelope_id: int, payload: EnvelopeUpdate, db: Session = Depends(get_db)
+    envelope_id: int,
+    payload: EnvelopeUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """Update an existing virtual budget envelope."""
-    envelope = db.query(BudgetEnvelope).filter(BudgetEnvelope.id == envelope_id).first()
+    envelope = (
+        db.query(BudgetEnvelope)
+        .filter(BudgetEnvelope.id == envelope_id, BudgetEnvelope.family_id == current_user.family_id)
+        .first()
+    )
     if not envelope:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Envelope {envelope_id} not found",
         )
+    require_family_parent(current_user, envelope.family_id)
     if payload.allocated_amount is not None:
         envelope.allocated_amount = payload.allocated_amount
     if payload.name is not None:
@@ -166,14 +186,23 @@ def update_envelope(
 
 
 @router.delete("/envelopes/{envelope_id}")
-def delete_envelope(envelope_id: int, db: Session = Depends(get_db)):
+def delete_envelope(
+    envelope_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Delete a budget envelope."""
-    envelope = db.query(BudgetEnvelope).filter(BudgetEnvelope.id == envelope_id).first()
+    envelope = (
+        db.query(BudgetEnvelope)
+        .filter(BudgetEnvelope.id == envelope_id, BudgetEnvelope.family_id == current_user.family_id)
+        .first()
+    )
     if not envelope:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Envelope {envelope_id} not found",
         )
+    require_family_parent(current_user, envelope.family_id)
     db.delete(envelope)
     db.commit()
     return {"message": f"Envelope {envelope_id} deleted successfully."}

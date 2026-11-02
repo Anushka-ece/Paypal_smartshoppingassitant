@@ -1,6 +1,6 @@
 import json
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock
+from unittest.mock import patch, AsyncMock
 
 import httpx
 from fastapi.testclient import TestClient
@@ -12,6 +12,8 @@ from app.main import app
 from app.database import Base, get_db
 from app.models.user import User, UserRole
 from app.models.account import Account, AccountType
+from app.models.family import Family
+from app.models.purchase_request import PurchaseRequest, PurchaseRequestStatus
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.webhook_event import ProcessedWebhookEvent
 from app.services.paypal_service import PayPalService
@@ -32,10 +34,12 @@ def db_session():
     Base.metadata.create_all(
         bind=test_engine,
         tables=[
+            Family.__table__,
             User.__table__,
             Account.__table__,
             Transaction.__table__,
             ProcessedWebhookEvent.__table__,
+            PurchaseRequest.__table__,
         ],
     )
 
@@ -48,7 +52,9 @@ def db_session():
 
 
 @pytest.fixture
-def valid_headers():
+def valid_headers(monkeypatch):
+    monkeypatch.setattr("app.services.paypal_service.APP_ENV", "test")
+    monkeypatch.setattr("app.services.paypal_service.PAYPAL_ALLOW_MOCK_WEBHOOKS", True)
     return {
         "PAYPAL-AUTH-ALGO": "SHA256withRSA",
         "PAYPAL-CERT-URL": "https://api.sandbox.paypal.com/cert",
@@ -93,7 +99,9 @@ async def test_verify_webhook_signature_missing_headers():
 
 
 @pytest.mark.anyio
-async def test_verify_webhook_signature_mock_success_and_failure():
+async def test_verify_webhook_signature_mock_success_and_failure(monkeypatch):
+    monkeypatch.setattr("app.services.paypal_service.APP_ENV", "test")
+    monkeypatch.setattr("app.services.paypal_service.PAYPAL_ALLOW_MOCK_WEBHOOKS", True)
     service = PayPalService(webhook_id="mock_webhook_id")
     body = json.dumps({"id": "WH-123", "event_type": "PAYMENT.CAPTURE.COMPLETED"}).encode("utf-8")
 
@@ -253,6 +261,49 @@ def test_webhook_routing_capture_completed(db_session, valid_headers):
         assert tx.currency == "USD"
         assert tx.status == TransactionStatus.COMPLETED.value
         assert tx.account_id == account.id
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_capture_webhook_completes_linked_purchase_request(db_session, valid_headers):
+    family = Family(name="Webhook Checkout Family")
+    db_session.add(family)
+    db_session.commit()
+    user = User(email="webhook-checkout@example.com", name="Webhook Child", role=UserRole.CHILD.value, family_id=family.id)
+    db_session.add(user)
+    db_session.commit()
+    account = Account(user_id=user.id, family_id=family.id, account_type=AccountType.CHILD_VIRTUAL.value)
+    db_session.add(account)
+    request = PurchaseRequest(
+        family_id=family.id,
+        child_id=user.id,
+        item_name="Music book",
+        store_url="https://music.example/book",
+        amount=12.0,
+        status=PurchaseRequestStatus.APPROVED.value,
+        paypal_order_id="ORDER-WEBHOOK-1",
+    )
+    db_session.add_all([account, request])
+    db_session.commit()
+    app.dependency_overrides[get_db] = lambda: db_session
+    payload = {
+        "id": "WH-EVT-CHECKOUT-CAPTURE",
+        "event_type": "PAYMENT.CAPTURE.COMPLETED",
+        "resource": {
+            "id": "CAP-CHECKOUT-1",
+            "status": "COMPLETED",
+            "amount": {"value": "12.00", "currency_code": "USD"},
+            "custom_id": f"purchase-request-{request.id}",
+            "supplementary_data": {"related_ids": {"order_id": "ORDER-WEBHOOK-1"}},
+        },
+    }
+    try:
+        response = client.post("/api/webhooks/paypal", json=payload, headers=valid_headers)
+        assert response.status_code == 200
+        db_session.refresh(request)
+        assert request.status == PurchaseRequestStatus.EXECUTED.value
+        assert request.paypal_capture_id == "CAP-CHECKOUT-1"
+        assert request.paypal_payment_status == "COMPLETED"
     finally:
         app.dependency_overrides.pop(get_db, None)
 
@@ -417,45 +468,54 @@ def test_webhook_routing_dispute_resolved(db_session, valid_headers):
         app.dependency_overrides.pop(get_db, None)
 
 
-def test_webhook_unsupported_event_returns_200_ignored(valid_headers):
+def test_webhook_unsupported_event_returns_200_ignored(db_session, valid_headers):
+    app.dependency_overrides[get_db] = lambda: db_session
     payload = {
         "id": "WH-EVT-UNSUPPORTED",
         "event_type": "INVOICING.INVOICE.PAID",
         "resource": {},
     }
-    response = client.post("/api/webhooks/paypal", json=payload, headers=valid_headers)
-    assert response.status_code == 200
-    assert response.json()["status"] == "ignored"
+    try:
+        response = client.post("/api/webhooks/paypal", json=payload, headers=valid_headers)
+        assert response.status_code == 200
+        assert response.json()["status"] == "ignored"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
 
-def test_webhook_route_mounted_at_both_paths(valid_headers):
+def test_webhook_route_mounted_at_both_paths(db_session, valid_headers):
+    app.dependency_overrides[get_db] = lambda: db_session
     payload1 = {"id": "WH-PATH-1", "event_type": "INVOICING.INVOICE.PAID"}
     payload2 = {"id": "WH-PATH-2", "event_type": "INVOICING.INVOICE.PAID"}
 
-    res_api = client.post("/api/webhooks/paypal", json=payload1, headers=valid_headers)
-    res_direct = client.post("/webhooks/paypal", json=payload2, headers=valid_headers)
+    try:
+        res_api = client.post("/api/webhooks/paypal", json=payload1, headers=valid_headers)
+        res_direct = client.post("/webhooks/paypal", json=payload2, headers=valid_headers)
+        assert res_api.status_code == 200
+        assert res_direct.status_code == 200
+        assert res_api.json()["status"] == "ignored"
+        assert res_direct.json()["status"] == "ignored"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
-    assert res_api.status_code == 200
-    assert res_direct.status_code == 200
-    assert res_api.json()["status"] == "ignored"
-    assert res_direct.json()["status"] == "ignored"
 
+def test_webhook_database_claim_prevents_duplicate_processing(db_session, valid_headers):
+    app.dependency_overrides[get_db] = lambda: db_session
+    try:
+        payload = {"id": "WH-DATABASE-CLAIM-01", "event_type": "INVOICING.INVOICE.PAID"}
+        first = client.post("/api/webhooks/paypal", json=payload, headers=valid_headers)
+        assert first.status_code == 200
+        assert first.json()["status"] == "ignored"
 
-def test_webhook_redis_idempotency_cache(valid_headers):
-    mock_redis = MagicMock()
-    # First time: key not present in Redis (None)
-    # Second time: key is found ("PROCESSED")
-    mock_redis.get.side_effect = [None, "PROCESSED"]
-
-    with patch("app.api.webhooks.get_redis_client", return_value=mock_redis):
-        payload = {"id": "WH-REDIS-CACHED-01", "event_type": "INVOICING.INVOICE.PAID"}
-        res1 = client.post("/api/webhooks/paypal", json=payload, headers=valid_headers)
-        assert res1.status_code == 200
-        assert res1.json()["status"] == "ignored"
-        assert mock_redis.set.called
-
-        res2 = client.post("/api/webhooks/paypal", json=payload, headers=valid_headers)
-        assert res2.status_code == 200
-        assert res2.json()["status"] == "already_processed"
-        assert res2.json()["event_id"] == "WH-REDIS-CACHED-01"
-
+        repeated = client.post("/api/webhooks/paypal", json=payload, headers=valid_headers)
+        assert repeated.status_code == 200
+        assert repeated.json()["status"] == "already_processed"
+        assert repeated.json()["event_id"] == "WH-DATABASE-CLAIM-01"
+        assert (
+            db_session.query(ProcessedWebhookEvent)
+            .filter_by(event_id="WH-DATABASE-CLAIM-01")
+            .count()
+            == 1
+        )
+    finally:
+        app.dependency_overrides.pop(get_db, None)

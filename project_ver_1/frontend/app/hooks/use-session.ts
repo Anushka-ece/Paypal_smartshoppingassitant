@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 
 const SESSION_KEY = "pennypilot_session_v1";
 
-type Session = { token: string; role: string };
+type Session = { token: string; role: string; family_id?: number };
 
 export function useSession() {
   const [session, setSession] = useState<Session | null>(null);

@@ -7,7 +7,11 @@ from app.database import Base
 
 class PurchaseRequestStatus(str, enum.Enum):
     PENDING_APPROVAL = "PENDING_APPROVAL"
+    ORDER_CREATING = "ORDER_CREATING"
     APPROVED = "APPROVED"
+    CAPTURE_PENDING = "CAPTURE_PENDING"
+    PAYMENT_FAILED = "PAYMENT_FAILED"
+    CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
     EXECUTED = "EXECUTED"
 
@@ -26,6 +30,9 @@ class PurchaseRequest(Base):
     ai_risk_assessment = Column(Text, nullable=True)
     rejection_reason = Column(Text, nullable=True)
     paypal_order_id = Column(String(255), nullable=True)
+    paypal_approval_url = Column(Text, nullable=True)
+    paypal_capture_id = Column(String(255), nullable=True)
+    paypal_payment_status = Column(String(50), nullable=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

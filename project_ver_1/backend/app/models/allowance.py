@@ -17,6 +17,10 @@ class AllowanceSchedule(Base):
     is_frozen = Column(Boolean, default=False, nullable=False)
     freeze_reason = Column(Text, nullable=True)
     last_payout_date = Column(DateTime(timezone=True), nullable=True)
+    last_payout_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    last_payout_status = Column(String(50), nullable=True)
+    last_payout_batch_id = Column(String(255), nullable=True)
+    last_payout_error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 

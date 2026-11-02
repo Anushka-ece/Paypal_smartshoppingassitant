@@ -9,6 +9,7 @@ from app.models.policy import FamilyPolicy
 from app.models.budget import BudgetEnvelope
 from app.models.allowance import AllowanceSchedule
 from app.models.purchase_request import PurchaseRequest, PurchaseRequestStatus
+from app.models.paypal_oauth_state import PayPalOAuthState
 
 __all__ = [
     "User",
@@ -27,5 +28,5 @@ __all__ = [
     "AllowanceSchedule",
     "PurchaseRequest",
     "PurchaseRequestStatus",
+    "PayPalOAuthState",
 ]
-

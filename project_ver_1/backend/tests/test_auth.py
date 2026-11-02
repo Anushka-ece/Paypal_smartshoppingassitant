@@ -1,4 +1,5 @@
-import json
+import hashlib
+from datetime import datetime, timedelta
 import pytest
 from unittest.mock import patch, AsyncMock
 import httpx
@@ -12,10 +13,26 @@ from app.database import Base, get_db
 from app.models.user import User, UserRole
 from app.models.family import Family
 from app.models.account import Account, AccountType
+from app.models.paypal_oauth_state import PayPalOAuthState
+from app.api import auth as auth_api
 from app.security.crypto import encrypt_token, decrypt_token
+from app.security.auth import get_current_user
 from app.services.paypal_service import PayPalService
 
 client = TestClient(app)
+
+
+def issue_oauth_state(db_session, user_id):
+    state = "test-state-" + str(user_id) + "-" + str(db_session.query(PayPalOAuthState).count())
+    db_session.add(
+        PayPalOAuthState(
+            state_hash=hashlib.sha256(state.encode()).hexdigest(),
+            user_id=user_id,
+            expires_at=datetime.utcnow() + timedelta(minutes=5),
+        )
+    )
+    db_session.commit()
+    return state
 
 
 # Setup an in-memory SQLite database for isolated database integration tests
@@ -32,7 +49,12 @@ def db_session():
     # Only create the tables required for auth & user-account testing
     Base.metadata.create_all(
         bind=test_engine,
-        tables=[Family.__table__, User.__table__, Account.__table__],
+        tables=[
+            Family.__table__,
+            User.__table__,
+            Account.__table__,
+            PayPalOAuthState.__table__,
+        ],
     )
 
     db = TestingSessionLocal()
@@ -203,18 +225,38 @@ def test_paypal_service_event_supported():
 # 3. Auth Endpoints Integration Tests (/authorize and /callback)
 # ----------------------------------------------------------------------
 
-def test_api_authorize_endpoint():
-    response = client.get("/api/auth/paypal/authorize?state=test_state_123")
-    assert response.status_code == 200
-    data = response.json()
-    assert "auth_url" in data
-    assert "https://www.sandbox.paypal.com/signin/authorize?" in data["auth_url"]
-    assert "state=test_state_123" in data["auth_url"]
+def test_api_authorize_endpoint(db_session):
+    family = Family(name="OAuth Family")
+    db_session.add(family)
+    db_session.commit()
+    user = User(email="authorize@example.com", role=UserRole.PARENT.value, family_id=family.id)
+    db_session.add(user)
+    db_session.commit()
+    app.dependency_overrides[get_db] = lambda: db_session
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[auth_api.get_paypal_service] = lambda: PayPalService(
+        client_id="sandbox-test-client",
+        client_secret="sandbox-test-secret",
+        base_url="https://api-m.sandbox.paypal.com",
+    )
+    try:
+        response = client.get("/api/auth/paypal/authorize?state=attacker_state")
+        assert response.status_code == 200
+        data = response.json()
+        assert "auth_url" in data
+        assert "https://www.sandbox.paypal.com/signin/authorize?" in data["auth_url"]
+        assert "state=attacker_state" not in data["auth_url"]
+        assert "state=" in data["auth_url"]
+        assert db_session.query(PayPalOAuthState).filter_by(user_id=user.id).count() == 1
 
-    # Direct /auth/authorize alias
-    res_direct = client.get("/auth/authorize")
-    assert res_direct.status_code == 200
-    assert "auth_url" in res_direct.json()
+        # Direct /auth/authorize alias also creates state bound to the session user.
+        res_direct = client.get("/auth/authorize")
+        assert res_direct.status_code == 200
+        assert db_session.query(PayPalOAuthState).filter_by(user_id=user.id).count() == 2
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+        app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides.pop(auth_api.get_paypal_service, None)
 
 
 def test_api_callback_get_links_user_and_encrypts_token(db_session):
@@ -238,6 +280,7 @@ def test_api_callback_get_links_user_and_encrypts_token(db_session):
 
     # Override get_db to use test SQLite session
     app.dependency_overrides[get_db] = lambda: db_session
+    state = issue_oauth_state(db_session, test_user.id)
 
     try:
         with patch.object(
@@ -246,7 +289,7 @@ def test_api_callback_get_links_user_and_encrypts_token(db_session):
             mock_exchange.return_value = mock_oauth_result
 
             response = client.get(
-                f"/api/auth/paypal/callback?code=mock_auth_code_123&user_id={test_user.id}"
+                f"/api/auth/paypal/callback?code=mock_auth_code_123&state={state}"
             )
             assert response.status_code == 200
             resp_data = response.json()
@@ -264,57 +307,27 @@ def test_api_callback_get_links_user_and_encrypts_token(db_session):
             assert account is not None
             assert account.paypal_account_id == "PAYPAL_ACC_9999"
             assert account.paypal_encrypted_token is not None
-            assert (
-                account.paypal_encrypted_token
-                != "secret_refresh_token_from_paypal_222"
-            )
+            assert account.paypal_encrypted_token != "access_token_mock_111"
+            assert account.paypal_encrypted_refresh_token != "secret_refresh_token_from_paypal_222"
 
-            # Decrypt stored token
-            decrypted = decrypt_token(account.paypal_encrypted_token)
-            assert decrypted == "secret_refresh_token_from_paypal_222"
+            assert decrypt_token(account.paypal_encrypted_token) == "access_token_mock_111"
+            assert decrypt_token(account.paypal_encrypted_refresh_token) == "secret_refresh_token_from_paypal_222"
+            assert account.paypal_access_token_expires_at is not None
     finally:
         app.dependency_overrides.pop(get_db, None)
 
 
-def test_api_callback_state_resolution(db_session):
-    # Verify user_id can be resolved from state if not passed directly
-    test_user = User(
-        email="state_user@example.com",
-        name="State User",
-        role=UserRole.PARENT.value,
-    )
-    db_session.add(test_user)
-    db_session.commit()
-    db_session.refresh(test_user)
-
-    mock_oauth_result = {
-        "access_token": "access_token_mock_state",
-        "refresh_token": "refresh_token_mock_state",
-        "payer_id": "STATE_PAYPAL_ID",
-    }
-
+def test_api_callback_rejects_untrusted_state(db_session):
     app.dependency_overrides[get_db] = lambda: db_session
     try:
         with patch.object(
             PayPalService, "exchange_oauth_code", new_callable=AsyncMock
         ) as mock_exchange:
-            mock_exchange.return_value = mock_oauth_result
-
-            # Test passing state as stringified JSON
-            state_json = json.dumps({"user_id": test_user.id})
             res = client.get(
-                f"/api/auth/paypal/callback?code=code_state_1&state={state_json}"
+                "/api/auth/paypal/callback?code=code_state_1&state=%7B%22user_id%22%3A1%7D"
             )
-            assert res.status_code == 200
-            assert res.json()["user_id"] == test_user.id
-
-            account = (
-                db_session.query(Account)
-                .filter(Account.user_id == test_user.id)
-                .first()
-            )
-            assert account is not None
-            assert decrypt_token(account.paypal_encrypted_token) == "refresh_token_mock_state"
+            assert res.status_code == 400
+            mock_exchange.assert_not_awaited()
     finally:
         app.dependency_overrides.pop(get_db, None)
 
@@ -333,9 +346,11 @@ def test_api_callback_post_endpoint(db_session):
         "access_token": "access_token_post",
         "refresh_token": "refresh_token_post",
         "payer_id": "POST_PAYPAL_ID",
+        "expires_in": 32400,
     }
 
     app.dependency_overrides[get_db] = lambda: db_session
+    state = issue_oauth_state(db_session, test_user.id)
     try:
         with patch.object(
             PayPalService, "exchange_oauth_code", new_callable=AsyncMock
@@ -344,7 +359,7 @@ def test_api_callback_post_endpoint(db_session):
 
             res = client.post(
                 "/api/auth/paypal/callback",
-                json={"code": "code_post_1", "user_id": test_user.id},
+                json={"code": "code_post_1", "state": state},
             )
             assert res.status_code == 200
             assert res.json()["status"] == "success"
@@ -353,22 +368,16 @@ def test_api_callback_post_endpoint(db_session):
         app.dependency_overrides.pop(get_db, None)
 
 
-def test_api_callback_user_not_found(db_session):
-    mock_oauth_result = {
-        "access_token": "token_abc",
-        "refresh_token": "token_xyz",
-    }
-
+def test_api_callback_state_for_missing_user_is_rejected(db_session):
+    state = issue_oauth_state(db_session, 999999)
     app.dependency_overrides[get_db] = lambda: db_session
     try:
         with patch.object(
             PayPalService, "exchange_oauth_code", new_callable=AsyncMock
         ) as mock_exchange:
-            mock_exchange.return_value = mock_oauth_result
-
-            res = client.get("/api/auth/paypal/callback?code=test_code&user_id=999999")
-            assert res.status_code == 404
-            assert "User with ID 999999 not found" in res.json()["detail"]
+            res = client.get(f"/api/auth/paypal/callback?code=test_code&state={state}")
+            assert res.status_code == 401
+            mock_exchange.assert_not_awaited()
     finally:
         app.dependency_overrides.pop(get_db, None)
 
@@ -392,6 +401,9 @@ def test_parent_registration_and_login_flow(db_session):
         assert data["status"] == "pending_verification"
         assert "user_id" in data
         assert "family_id" in data
+        registered_user = db_session.query(User).filter_by(email="marge@example.com").one()
+        assert registered_user.hashed_password.startswith("$argon2")
+        assert registered_user.hashed_password != reg_payload["password"]
 
         # Login with correct password
         login_res = client.post(
@@ -455,4 +467,3 @@ def test_registration_duplicate_email_rejected(db_session):
         assert "already exists" in res2.json()["detail"]
     finally:
         app.dependency_overrides.pop(get_db, None)
-

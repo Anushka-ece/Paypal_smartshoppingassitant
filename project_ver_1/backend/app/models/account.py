@@ -1,6 +1,6 @@
 from datetime import datetime
 import enum
-from sqlalchemy import Column, Integer, String, Float, Boolean, Text, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, Boolean, Text, DateTime, ForeignKey, Index
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -13,6 +13,13 @@ class AccountType(str, enum.Enum):
 
 class Account(Base):
     __tablename__ = "accounts"
+    __table_args__ = (
+        Index(
+            "uq_accounts_paypal_account_id",
+            "paypal_account_id",
+            unique=True,
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
@@ -22,6 +29,8 @@ class Account(Base):
     currency = Column(String(3), default="USD", nullable=False)
     paypal_account_id = Column(String(255), nullable=True, index=True)
     paypal_encrypted_token = Column(Text, nullable=True)
+    paypal_encrypted_refresh_token = Column(Text, nullable=True)
+    paypal_access_token_expires_at = Column(DateTime(timezone=True), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)

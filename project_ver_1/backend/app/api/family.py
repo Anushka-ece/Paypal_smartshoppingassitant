@@ -9,7 +9,7 @@ from app.database import get_db
 from app.models.user import User, UserRole
 from app.models.family import Family
 from app.models.invite import FamilyInvite
-from app.security.auth import get_current_user, require_parent
+from app.security.auth import get_current_user, require_family_member, require_parent
 
 router = APIRouter(prefix="/family", tags=["Family"])
 
@@ -24,11 +24,14 @@ class InviteRequest(BaseModel):
 def list_family_members(
     family_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """List members of a family."""
-    query = db.query(User)
-    if family_id:
-        query = query.filter(User.family_id == family_id)
+    target_family_id = family_id if family_id is not None else current_user.family_id
+    if target_family_id is None:
+        raise HTTPException(status_code=404, detail="Family not found.")
+    require_family_member(current_user, target_family_id)
+    query = db.query(User).filter(User.family_id == target_family_id)
     members = query.all()
     return [
         {
@@ -48,11 +51,15 @@ def list_family_members(
 def create_family_invitation(
     payload: InviteRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_parent),
 ):
     """Create a family invitation token."""
     target_family_id = payload.family_id
     if not target_family_id:
-        raise HTTPException(status_code=400, detail="family_id is required.")
+        target_family_id = current_user.family_id
+    if target_family_id is None:
+        raise HTTPException(status_code=404, detail="Family not found.")
+    require_family_member(current_user, target_family_id)
 
     family = db.query(Family).filter(Family.id == target_family_id).first()
     if not family:
@@ -63,9 +70,10 @@ def create_family_invitation(
 
     invite = FamilyInvite(
         family_id=family.id,
+        invited_by_id=current_user.id,
         email=str(payload.email).lower(),
         role=payload.role.upper(),
-        token=token,
+        invite_token=token,
         expires_at=expires_at,
         is_accepted=False,
     )
@@ -78,7 +86,7 @@ def create_family_invitation(
         "email": invite.email,
         "role": invite.role,
         "family_id": invite.family_id,
-        "token": invite.token,
+        "token": invite.invite_token,
         "expires_at": invite.expires_at.isoformat(),
         "is_accepted": invite.is_accepted,
     }

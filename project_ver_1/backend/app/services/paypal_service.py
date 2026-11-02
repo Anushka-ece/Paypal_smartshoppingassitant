@@ -1,12 +1,18 @@
 import json
+import math
+import time
 import urllib.parse
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Union, List
+from typing import Optional, Dict, Any, Union, List, Tuple
+from urllib.parse import urlparse
 import httpx
 from app.config import (
+    APP_ENV,
     PAYPAL_BASE_URL,
     PAYPAL_CLIENT_ID,
     PAYPAL_CLIENT_SECRET,
+    PAYPAL_ALLOW_MOCK_WEBHOOKS,
+    PAYPAL_PAYOUTS_ENABLED,
     PAYPAL_REDIRECT_URI,
     PAYPAL_WEBHOOK_ID,
 )
@@ -25,6 +31,8 @@ class AwaitableList(list):
 
 
 class PayPalService:
+    _token_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
+
     SUPPORTED_WEBHOOK_EVENTS = {
         "PAYMENT.CAPTURE.COMPLETED",
         "PAYMENT.CAPTURE.REFUNDED",
@@ -52,6 +60,7 @@ class PayPalService:
         self.base_url = (base_url or PAYPAL_BASE_URL).rstrip("/")
         self.webhook_id = webhook_id or PAYPAL_WEBHOOK_ID
         self._app_access_token: Optional[str] = None
+        self._app_access_token_expires_at = 0.0
 
 
     def get_authorization_url(
@@ -61,6 +70,7 @@ class PayPalService:
         scope: Optional[str] = None,
     ) -> str:
         """Constructs the PayPal OAuth 2.0 authorization URL."""
+        self._require_sandbox_api()
         if "sandbox" in self.base_url.lower():
             auth_base = "https://www.sandbox.paypal.com/signin/authorize"
         else:
@@ -83,6 +93,7 @@ class PayPalService:
         redirect_uri: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Exchanges an authorization code for PayPal access and refresh tokens."""
+        self._require_sandbox_api()
         token_url = f"{self.base_url}/v1/oauth2/token"
         headers = {
             "Accept": "application/json",
@@ -110,6 +121,9 @@ class PayPalService:
         Refreshes an access token using a refresh token.
         Accepts either an encrypted refresh token (auto-decrypted) or raw refresh token string.
         """
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            raise ValueError("A PayPal refresh token is required.")
+        self._require_sandbox_api()
         raw_token = refresh_token
         try:
             raw_token = decrypt_token(refresh_token)
@@ -142,6 +156,7 @@ class PayPalService:
 
     async def get_user_info(self, access_token: str) -> Dict[str, Any]:
         """Fetches the user's PayPal identity profile using the access token."""
+        self._require_sandbox_api()
         userinfo_url = f"{self.base_url}/v1/identity/oauth2/userinfo?schema=paypalv1.1"
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -159,11 +174,16 @@ class PayPalService:
 
     async def get_app_access_token(self) -> str:
         """Fetches an application-level access token via client credentials grant."""
-        if self._app_access_token:
+        self._require_sandbox_api()
+        cache_key = (self.base_url, self.client_id)
+        now = time.monotonic()
+        cached = self._token_cache.get(cache_key)
+        if cached and cached[1] > now:
+            self._app_access_token, self._app_access_token_expires_at = cached
             return self._app_access_token
 
-        if self.client_id in ("mock_client_id", "mock", "test") or not self.client_id:
-            return "mock_app_access_token"
+        if not self.client_id or not self.client_secret:
+            raise RuntimeError("PayPal client credentials are not configured.")
 
         token_url = f"{self.base_url}/v1/oauth2/token"
         headers = {
@@ -180,8 +200,29 @@ class PayPalService:
                 timeout=10.0,
             )
             resp.raise_for_status()
-            self._app_access_token = resp.json().get("access_token", "")
-            return self._app_access_token
+            token_payload = resp.json()
+            access_token = token_payload.get("access_token")
+            if not access_token:
+                raise RuntimeError("PayPal OAuth response did not contain an access token.")
+
+            expires_in = token_payload.get("expires_in")
+            if isinstance(expires_in, (int, float)) and expires_in > 0:
+                cache_ttl = expires_in - min(60.0, expires_in * 0.1)
+                self._app_access_token_expires_at = now + cache_ttl
+                self._token_cache[cache_key] = (
+                    access_token,
+                    self._app_access_token_expires_at,
+                )
+            else:
+                self._app_access_token_expires_at = 0.0
+                self._token_cache.pop(cache_key, None)
+
+            self._app_access_token = access_token
+            return access_token
+
+    async def get_access_token(self) -> Dict[str, Any]:
+        """Compatibility wrapper returning the token payload shape expected by callers."""
+        return {"access_token": await self.get_app_access_token()}
 
     async def verify_webhook_signature(
         self,
@@ -233,13 +274,24 @@ class PayPalService:
             or transmission_sig in ("valid_signature", "valid-signature", "mock-valid-signature")
         )
 
-        if is_mock_webhook or is_mock_sig:
+        if (
+            PAYPAL_ALLOW_MOCK_WEBHOOKS
+            and APP_ENV.lower() in {"local", "development", "test"}
+            and (is_mock_webhook or is_mock_sig)
+        ):
             if transmission_sig in ("mock-invalid", "invalid-signature", "invalid", "mock-invalid-sig") or auth_algo == "INVALID":
                 return False
             return True
 
         # PayPal API Verification
         try:
+            paypal_host = urlparse(self.base_url)
+            if (
+                paypal_host.scheme != "https"
+                or paypal_host.hostname
+                not in {"api-m.sandbox.paypal.com", "api-m.paypal.com"}
+            ):
+                return False
             access_token = await self.get_app_access_token()
             verify_url = f"{self.base_url}/v1/notifications/verify-webhook-signature"
             verify_payload = {
@@ -400,6 +452,7 @@ class PayPalService:
         Handles pagination, automatic mock fallback, and parsed record mapping.
         Callable synchronously or awaitable in async contexts.
         """
+        self._require_sandbox_api()
         raw_token = access_token
         try:
             raw_token = decrypt_token(access_token)
@@ -522,21 +575,20 @@ class PayPalService:
         """
         Executes a PayPal Payout (POST /v1/payments/payouts) with idempotency key.
         """
-        if not self.client_id or not self.client_secret or self.client_id.startswith("mock") or self.client_id.startswith("test"):
-            # Mock sandbox response
-            return {
-                "batch_id": f"PAYOUT-BATCH-{idempotency_key[:16]}",
-                "status": "SUCCESS",
-                "receiver": receiver_email,
-                "amount": amount,
-                "currency": currency,
-                "idempotency_key": idempotency_key,
-                "created_at": datetime.utcnow().isoformat(),
-            }
+        self._require_sandbox_api()
+        if not receiver_email or not idempotency_key or not math.isfinite(amount) or amount <= 0:
+            raise ValueError("A valid receiver, positive payout amount, and idempotency key are required.")
+        if len(currency) != 3 or not currency.isascii() or not currency.isalpha():
+            raise ValueError("PayPal payout currency must be a three-letter ISO currency code.")
+        currency = currency.upper()
+        if not PAYPAL_PAYOUTS_ENABLED:
+            raise RuntimeError("PayPal payouts are disabled. Set PAYPAL_PAYOUTS_ENABLED=true to enable them.")
 
         url = f"{self.base_url}/v1/payments/payouts"
         token_info = await self.get_access_token()
         token = token_info.get("access_token", "")
+        if not token:
+            raise RuntimeError("PayPal did not provide an access token for the payout.")
 
         headers = {
             "Authorization": f"Bearer {token}",
@@ -579,59 +631,80 @@ class PayPalService:
         amount: float,
         currency: str = "USD",
         description: str = "Family Pre-Purchase Request",
+        request_id: Optional[int] = None,
+        return_url: Optional[str] = None,
+        cancel_url: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Creates a PayPal Order for pre-approved child store requests."""
-        if not self.client_id or not self.client_secret or self.client_id.startswith("mock") or self.client_id.startswith("test"):
-            return {
-                "id": f"ORDER-MOCK-{int(time.time())}",
-                "status": "CREATED",
-                "amount": amount,
-                "currency": currency,
-            }
+        """Creates a sandbox PayPal Order and returns its approval link."""
+        self._require_sandbox_api()
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError("PayPal order amount must be a positive finite number.")
+        if len(currency) != 3 or not currency.isascii() or not currency.isalpha():
+            raise ValueError("PayPal order currency must be a three-letter ISO currency code.")
+        currency = currency.upper()
+        if not return_url or not cancel_url:
+            raise ValueError("PayPal return and cancellation URLs are required.")
 
         url = f"{self.base_url}/v2/checkout/orders"
         token_info = await self.get_access_token()
         token = token_info.get("access_token", "")
+        if not token:
+            raise RuntimeError("PayPal did not provide an access token for the order.")
 
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        if request_id is not None:
+            headers["PayPal-Request-Id"] = f"purchase-order-{request_id}"
+        purchase_unit = {
+            "amount": {"currency_code": currency, "value": f"{amount:.2f}"},
+            "description": description,
+        }
+        if request_id is not None:
+            purchase_unit["custom_id"] = f"purchase-request-{request_id}"
         payload = {
             "intent": "CAPTURE",
-            "purchase_units": [
-                {
-                    "amount": {"currency_code": currency, "value": f"{amount:.2f}"},
-                    "description": description,
-                }
-            ],
+            "purchase_units": [purchase_unit],
+            "application_context": {
+                "return_url": return_url,
+                "cancel_url": cancel_url,
+                "user_action": "PAY_NOW",
+            },
         }
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             return resp.json()
 
-    async def capture_approved_order(self, order_id: str) -> Dict[str, Any]:
-        """Captures a pre-approved PayPal Order."""
-        if not self.client_id or not self.client_secret or self.client_id.startswith("mock") or self.client_id.startswith("test"):
-            return {
-                "id": order_id,
-                "status": "COMPLETED",
-                "capture_id": f"CAPTURE-{order_id}",
-            }
+    async def capture_approved_order(
+        self, order_id: str, request_id: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Captures a PayPal-approved sandbox order idempotently."""
+        self._require_sandbox_api()
 
         url = f"{self.base_url}/v2/checkout/orders/{order_id}/capture"
         token_info = await self.get_access_token()
         token = token_info.get("access_token", "")
+        if not token:
+            raise RuntimeError("PayPal did not provide an access token for the capture.")
 
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
+        if request_id is not None:
+            headers["PayPal-Request-Id"] = f"purchase-capture-{request_id}"
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(url, headers=headers)
             resp.raise_for_status()
             return resp.json()
+
+    def _require_sandbox_api(self) -> None:
+        if urlparse(self.base_url).hostname != "api-m.sandbox.paypal.com":
+            raise RuntimeError("PayPal payment operations are restricted to the sandbox API.")
+        if not self.client_id or not self.client_secret:
+            raise RuntimeError("PayPal client credentials are not configured.")
 
 
 # Legacy helper placeholders

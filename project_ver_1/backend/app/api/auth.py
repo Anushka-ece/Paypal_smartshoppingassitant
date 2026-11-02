@@ -1,10 +1,12 @@
-import json
+import hashlib
 import logging
-import urllib.parse
+import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, status
 from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 import httpx
 
@@ -12,9 +14,11 @@ from app.database import get_db
 from app.models.user import User, UserRole
 from app.models.family import Family
 from app.models.account import Account, AccountType
+from app.models.paypal_oauth_state import PayPalOAuthState
+from app.config import PAYPAL_REDIRECT_URI
 from app.services.paypal_service import PayPalService
 from app.security.crypto import encrypt_token
-from app.security.auth import create_access_token, hash_password, verify_password
+from app.security.auth import create_access_token, get_current_user, hash_password, require_parent, verify_password
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +37,7 @@ class ParentRegistration(BaseModel):
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str
+    password: str = Field(min_length=1, max_length=128)
 
 
 @router.post("/register", status_code=201)
@@ -54,10 +58,10 @@ def register_parent(payload: ParentRegistration, db: Session = Depends(get_db)):
         is_verified=False,
     )
     db.add(parent)
-    db.commit()
-    db.refresh(parent)
+    db.flush()
     family.created_by_user_id = parent.id
     db.commit()
+    db.refresh(parent)
     return {"status": "pending_verification", "user_id": parent.id, "family_id": family.id}
 
 
@@ -80,6 +84,8 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
     user.failed_login_attempts = 0
     user.locked_until = None
+    if not user.hashed_password.startswith("$argon2"):
+        user.hashed_password = hash_password(payload.password)
     db.commit()
     return {
         "access_token": create_access_token(user),
@@ -91,169 +97,200 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 
 class CallbackPayload(BaseModel):
-    code: str
-    state: Optional[str] = None
-    user_id: Optional[int] = None
+    code: str = Field(min_length=1, max_length=2048)
+    state: Optional[str] = Field(default=None, max_length=256)
+
+
+@router.post("/logout")
+def logout(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    user.auth_token_version = (user.auth_token_version or 0) + 1
+    db.commit()
+    return {"status": "logged_out"}
+
+
+def _create_paypal_authorization(user: User, db: Session, service: PayPalService):
+    state = secrets.token_urlsafe(32)
+    try:
+        auth_url = service.get_authorization_url(redirect_uri=PAYPAL_REDIRECT_URI, state=state)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail="PayPal Sandbox credentials are not configured.") from exc
+    state_record = PayPalOAuthState(
+        state_hash=hashlib.sha256(state.encode("utf-8")).hexdigest(),
+        user_id=user.id,
+        expires_at=datetime.utcnow() + timedelta(minutes=10),
+    )
+    db.add(state_record)
+    db.commit()
+    return {"auth_url": auth_url}
 
 
 @router.get("/login")
-def paypal_login(service: PayPalService = Depends(get_paypal_service)):
-    """Legacy helper returning PayPal authorization URL."""
-    return {"auth_url": service.get_authorization_url()}
+def paypal_login(
+    user: User = Depends(require_parent),
+    db: Session = Depends(get_db),
+    service: PayPalService = Depends(get_paypal_service),
+):
+    """Compatibility endpoint that starts an authenticated PayPal OAuth flow."""
+    return _create_paypal_authorization(user, db, service)
 
 
 @router.get("/paypal/authorize")
 @router.get("/authorize")
 def paypal_authorize(
-    redirect_uri: Optional[str] = Query(None),
-    state: Optional[str] = Query(None),
-    scope: Optional[str] = Query(None),
+    user: User = Depends(require_parent),
+    db: Session = Depends(get_db),
     service: PayPalService = Depends(get_paypal_service),
 ):
-    """
-    Generates PayPal OAuth 2.0 authorization URL for connecting a PayPal account.
-    """
-    auth_url = service.get_authorization_url(
-        redirect_uri=redirect_uri,
-        state=state,
-        scope=scope,
-    )
-    return {"auth_url": auth_url}
+    """Generate an authorization URL with a one-time state bound to the user."""
+    return _create_paypal_authorization(user, db, service)
 
 
 async def _handle_callback_logic(
     code: str,
     state: Optional[str],
-    user_id: Optional[int],
     db: Session,
     service: PayPalService,
 ):
+    if not state:
+        raise HTTPException(status_code=400, detail="Invalid or expired PayPal OAuth state.")
+    state_hash = hashlib.sha256(state.encode("utf-8")).hexdigest()
+    now = datetime.utcnow()
+    db.query(PayPalOAuthState).filter(PayPalOAuthState.expires_at <= now).delete(
+        synchronize_session=False
+    )
+    consumed = db.execute(
+        update(PayPalOAuthState)
+        .where(
+            PayPalOAuthState.state_hash == state_hash,
+            PayPalOAuthState.consumed_at.is_(None),
+            PayPalOAuthState.expires_at > now,
+        )
+        .values(consumed_at=now)
+    )
+    if consumed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Invalid or expired PayPal OAuth state.")
+    state_record = db.query(PayPalOAuthState).filter(PayPalOAuthState.state_hash == state_hash).first()
+    if state_record is None:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Invalid or expired PayPal OAuth state.")
+    user = db.query(User).filter(User.id == state_record.user_id).first()
+    if user is None or str(user.role).upper() not in ("PARENT", "CO_PARENT"):
+        db.rollback()
+        raise HTTPException(status_code=401, detail="PayPal OAuth user is no longer authorized.")
+    db.commit()
+
     try:
-        tokens = await service.exchange_oauth_code(code=code)
-    except httpx.HTTPStatusError as e:
+        tokens = await service.exchange_oauth_code(code=code, redirect_uri=PAYPAL_REDIRECT_URI)
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"PayPal token exchange failed: {e.response.text}",
-        ) from e
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Error exchanging PayPal code: {str(e)}",
-        ) from e
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="PayPal authorization could not be completed.",
+        ) from exc
 
     access_token = tokens.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise HTTPException(status_code=502, detail="PayPal did not return an access token.")
+    try:
+        expires_in = int(tokens["expires_in"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="PayPal returned an invalid access-token lifetime.",
+        ) from exc
+    if expires_in <= 0:
+        raise HTTPException(status_code=502, detail="PayPal returned an invalid access-token lifetime.")
     refresh_token = tokens.get("refresh_token")
-    token_to_encrypt = refresh_token or access_token
-    encrypted_token = encrypt_token(token_to_encrypt) if token_to_encrypt else None
+    if refresh_token is not None and (not isinstance(refresh_token, str) or not refresh_token):
+        raise HTTPException(status_code=502, detail="PayPal returned an invalid refresh token.")
 
-    # Retrieve PayPal account / payer ID
     paypal_account_id = tokens.get("payer_id") or tokens.get("user_id")
-    if not paypal_account_id and access_token:
+    if not isinstance(paypal_account_id, str) or not paypal_account_id:
         try:
             user_info = await service.get_user_info(access_token)
-            paypal_account_id = user_info.get("user_id") or user_info.get("payer_id")
-        except Exception:
-            pass
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            raise HTTPException(status_code=502, detail="PayPal account identity could not be verified.") from exc
+        paypal_account_id = user_info.get("user_id") or user_info.get("payer_id")
+    if not isinstance(paypal_account_id, str) or not paypal_account_id:
+        raise HTTPException(status_code=502, detail="PayPal did not provide a verifiable account identity.")
 
-    # Extract target user id from user_id parameter or state
-    target_user_id = user_id
-    if target_user_id is None and state:
-        try:
-            target_user_id = int(state)
-        except ValueError:
-            try:
-                state_data = json.loads(state)
-                if isinstance(state_data, dict) and "user_id" in state_data:
-                    target_user_id = int(state_data["user_id"])
-            except Exception:
-                if "user_id=" in state:
-                    parsed = urllib.parse.parse_qs(state)
-                    if "user_id" in parsed:
-                        target_user_id = int(parsed["user_id"][0])
+    existing_owner = (
+        db.query(Account)
+        .filter(Account.paypal_account_id == paypal_account_id)
+        .first()
+    )
+    if existing_owner and existing_owner.user_id != user.id:
+        raise HTTPException(status_code=409, detail="This PayPal account is already linked to another user.")
 
-    account = None
-    if target_user_id is not None:
-        user = db.query(User).filter(User.id == target_user_id).first()
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User with ID {target_user_id} not found",
-            )
-
-        # Look for existing PayPal linked account or parent wallet
-        account = (
-            db.query(Account)
-            .filter(
-                Account.user_id == user.id,
-                Account.account_type.in_(
-                    [AccountType.PAYPAL_LINKED.value, AccountType.PARENT_WALLET.value]
-                ),
-            )
-            .first()
+    account = existing_owner or (
+        db.query(Account)
+        .filter(
+            Account.user_id == user.id,
+            Account.account_type == AccountType.PAYPAL_LINKED.value,
         )
+        .first()
+    )
+    if account and account.paypal_account_id not in (None, paypal_account_id):
+        raise HTTPException(status_code=409, detail="A different PayPal account is already linked to this user.")
+    if account is None:
+        account = Account(
+            user_id=user.id,
+            family_id=user.family_id,
+            account_type=AccountType.PAYPAL_LINKED.value,
+            balance=0.0,
+            currency="USD",
+            is_active=True,
+        )
+        db.add(account)
 
-        if account:
-            account.paypal_encrypted_token = encrypted_token
-            if paypal_account_id:
-                account.paypal_account_id = paypal_account_id
-            account.is_active = True
-        else:
-            account = Account(
-                user_id=user.id,
-                family_id=user.family_id,
-                account_type=AccountType.PAYPAL_LINKED.value,
-                paypal_account_id=paypal_account_id,
-                paypal_encrypted_token=encrypted_token,
-                balance=0.0,
-                currency="USD",
-                is_active=True,
-            )
-            db.add(account)
+    try:
+        encrypted_access_token = encrypt_token(access_token)
+        encrypted_refresh_token = encrypt_token(refresh_token) if refresh_token else None
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Configure a strong TOKEN_ENCRYPTION_KEY before linking PayPal.",
+        ) from exc
 
+    account.paypal_account_id = paypal_account_id
+    account.paypal_encrypted_token = encrypted_access_token
+    account.paypal_encrypted_refresh_token = encrypted_refresh_token
+    account.paypal_access_token_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+    account.is_active = True
+    try:
         db.commit()
-        db.refresh(account)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="This PayPal account is already linked.") from exc
+    db.refresh(account)
 
-        # Trigger historical transaction ingestion via Celery (or synchronous fallback)
-        try:
-            from app.workers.celery_worker import sync_historical_transactions_task
-            from app.api.webhooks import get_redis_client
+    try:
+        from app.workers.celery_worker import sync_historical_transactions_task
+        from app.api.webhooks import get_redis_client
 
-            is_broker_ready = bool(get_redis_client() is not None)
-            if is_broker_ready:
-                try:
-                    sync_historical_transactions_task.delay(account.id)
-                except Exception as celery_err:
-                    logger.info(f"Celery delay failed ({celery_err}), falling back to sync: {celery_err}")
-                    try:
-                        sync_historical_transactions_task(account.id, db=db)
-                    except Exception as sync_err:
-                        logger.warning(f"Historical sync fallback failed: {sync_err}")
-            else:
-                try:
-                    sync_historical_transactions_task(account.id, db=db)
-                except Exception as sync_err:
-                    logger.warning(f"Synchronous historical sync fallback failed: {sync_err}")
-        except Exception as e:
-            logger.warning(f"Could not trigger historical sync for account {account.id}: {e}")
+        if get_redis_client() is not None:
+            sync_historical_transactions_task.delay(account.id)
+        else:
+            logger.info("Historical PayPal sync deferred because the task broker is unavailable.")
+    except Exception as exc:
+        logger.warning("Could not enqueue historical PayPal sync for account %s: %s", account.id, exc)
 
     return {
         "status": "success",
-        "message": "PayPal account linked successfully"
-        if account
-        else "Tokens exchanged successfully",
-        "user_id": target_user_id,
-        "account_id": account.id if account else None,
+        "message": "PayPal account linked successfully",
+        "user_id": user.id,
+        "account_id": account.id,
         "paypal_account_id": paypal_account_id,
-        "encrypted_token_stored": bool(account and account.paypal_encrypted_token),
+        "encrypted_token_stored": bool(account.paypal_encrypted_token),
+        "refresh_token_available": bool(account.paypal_encrypted_refresh_token),
     }
 
 
 @router.get("/paypal/callback")
 @router.get("/callback")
 async def paypal_callback_get(
-    code: str = Query(..., description="Authorization code from PayPal OAuth redirect"),
-    state: Optional[str] = Query(None, description="Optional OAuth state"),
-    user_id: Optional[int] = Query(None, description="Optional User ID to link"),
+    code: str = Query(..., min_length=1, max_length=2048, description="Authorization code from PayPal OAuth redirect"),
+    state: Optional[str] = Query(None, max_length=256, description="One-time server-issued OAuth state"),
     db: Session = Depends(get_db),
     service: PayPalService = Depends(get_paypal_service),
 ):
@@ -261,7 +298,6 @@ async def paypal_callback_get(
     return await _handle_callback_logic(
         code=code,
         state=state,
-        user_id=user_id,
         db=db,
         service=service,
     )
@@ -278,7 +314,6 @@ async def paypal_callback_post(
     return await _handle_callback_logic(
         code=payload.code,
         state=payload.state,
-        user_id=payload.user_id,
         db=db,
         service=service,
     )

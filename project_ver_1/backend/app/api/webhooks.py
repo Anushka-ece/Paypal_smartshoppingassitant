@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, Request, HTTPException, Depends
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from app.database import get_db
 from app.config import REDIS_URL
 from app.models.transaction import Transaction, TransactionStatus
 from app.models.account import Account
+from app.models.purchase_request import PurchaseRequest, PurchaseRequestStatus
 from app.models.webhook_event import ProcessedWebhookEvent
 from app.services.paypal_service import PayPalService
 
@@ -56,30 +58,74 @@ def get_paypal_service() -> PayPalService:
 
 
 def is_event_already_processed(event_id: str, db: Optional[Session] = None) -> bool:
-    """Checks Redis and PostgreSQL/SQLite for event deduplication."""
-    # 1. Check Redis cache
-    try:
-        r = get_redis_client()
-        if r is not None:
-            if r.get(f"paypal:webhook:event:{event_id}"):
-                return True
-    except Exception:
-        pass
-
-    # 2. Check Database
+    """Checks the persistent event record; Redis is not authoritative for deduplication."""
     if db is not None:
-        try:
-            exists = (
-                db.query(ProcessedWebhookEvent)
-                .filter(ProcessedWebhookEvent.event_id == event_id)
-                .first()
-            )
-            if exists:
-                return True
-        except Exception:
-            pass
-
+        event = (
+            db.query(ProcessedWebhookEvent)
+            .filter(ProcessedWebhookEvent.event_id == event_id)
+            .first()
+        )
+        return bool(event and event.status != "FAILED")
     return False
+
+
+def claim_webhook_event(
+    event_id: str,
+    event_type: str,
+    resource_type: Optional[str],
+    resource_id: Optional[str],
+    db: Session,
+) -> bool:
+    """Atomically claims an event using its unique database key before handling it."""
+    event = ProcessedWebhookEvent(
+        event_id=event_id,
+        event_type=event_type,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        status="PROCESSING",
+    )
+    db.add(event)
+    try:
+        db.commit()
+        return True
+    except IntegrityError:
+        db.rollback()
+
+    existing = (
+        db.query(ProcessedWebhookEvent)
+        .filter(ProcessedWebhookEvent.event_id == event_id)
+        .first()
+    )
+    if existing is None:
+        raise RuntimeError(f"Unable to claim PayPal webhook event {event_id}.")
+
+    stale_before = datetime.utcnow() - timedelta(minutes=5)
+    reclaimable = (
+        (ProcessedWebhookEvent.status == "FAILED")
+        | (
+            (ProcessedWebhookEvent.status == "PROCESSING")
+            & (ProcessedWebhookEvent.created_at < stale_before)
+        )
+    )
+    updated = (
+        db.query(ProcessedWebhookEvent)
+        .filter(
+            ProcessedWebhookEvent.id == existing.id,
+            reclaimable,
+        )
+        .update(
+            {
+                ProcessedWebhookEvent.status: "PROCESSING",
+                ProcessedWebhookEvent.created_at: datetime.utcnow(),
+                ProcessedWebhookEvent.event_type: event_type,
+                ProcessedWebhookEvent.resource_type: resource_type,
+                ProcessedWebhookEvent.resource_id: resource_id,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return updated == 1
 
 
 def record_processed_event(
@@ -91,33 +137,28 @@ def record_processed_event(
     summary: Optional[str] = None,
     db: Optional[Session] = None,
 ) -> None:
-    """Records event in both Redis (with 24h TTL) and persistent Database."""
-    # 1. Cache in Redis
+    """Persists the final processing state for a previously claimed event."""
+    if db is None:
+        raise RuntimeError("A database session is required to persist PayPal webhook events.")
+    entry = (
+        db.query(ProcessedWebhookEvent)
+        .filter(ProcessedWebhookEvent.event_id == event_id)
+        .first()
+    )
+    if entry is None:
+        entry = ProcessedWebhookEvent(event_id=event_id, event_type=event_type)
+        db.add(entry)
+    entry.event_type = event_type
+    entry.resource_type = resource_type
+    entry.resource_id = resource_id
+    entry.status = status
+    entry.summary = summary
     try:
-        r = get_redis_client()
-        if r is not None:
-            r.set(f"paypal:webhook:event:{event_id}", status, ex=86400)
+        db.commit()
     except Exception:
-        pass
-
-    # 2. Persist in Database
-    if db is not None:
-        try:
-            entry = ProcessedWebhookEvent(
-                event_id=event_id,
-                event_type=event_type,
-                resource_type=resource_type,
-                resource_id=resource_id,
-                status=status,
-                summary=summary,
-            )
-            db.add(entry)
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-        except Exception as e:
-            logger.warning(f"Failed to persist webhook event record: {e}")
-            db.rollback()
+        db.rollback()
+        logger.exception("Failed to persist PayPal webhook event %s", event_id)
+        raise
 
 
 def handle_capture_completed(
@@ -139,11 +180,29 @@ def handle_capture_completed(
     summary = event.get("summary") or "Payment capture completed"
 
     tx = None
+    purchase_request = None
     if db is not None:
         # Find matching account
         account = None
         custom_id = resource.get("custom_id")
-        if custom_id and str(custom_id).isdigit():
+        if isinstance(custom_id, str) and custom_id.startswith("purchase-request-"):
+            request_id = custom_id.removeprefix("purchase-request-")
+            if request_id.isdigit():
+                purchase_request = (
+                    db.query(PurchaseRequest)
+                    .filter_by(id=int(request_id))
+                    .first()
+                )
+                if purchase_request:
+                    account = (
+                        db.query(Account)
+                        .filter_by(
+                            user_id=purchase_request.child_id,
+                            family_id=purchase_request.family_id,
+                        )
+                        .first()
+                    )
+        elif custom_id and str(custom_id).isdigit():
             account = db.query(Account).filter_by(id=int(custom_id)).first()
 
         if not account:
@@ -173,12 +232,32 @@ def handle_capture_completed(
             db.commit()
             db.refresh(tx)
 
+        supplementary_data = resource.get("supplementary_data")
+        if not isinstance(supplementary_data, dict):
+            supplementary_data = {}
+        related_ids = supplementary_data.get("related_ids", {})
+        order_id = related_ids.get("order_id") if isinstance(related_ids, dict) else None
+        if not purchase_request and order_id:
+            purchase_request = (
+                db.query(PurchaseRequest)
+                .filter_by(paypal_order_id=order_id)
+                .first()
+            )
+        if purchase_request:
+            paypal_status = resource.get("status") or "COMPLETED"
+            if paypal_status == "COMPLETED":
+                purchase_request.paypal_capture_id = capture_id
+                purchase_request.paypal_payment_status = paypal_status
+                purchase_request.status = PurchaseRequestStatus.EXECUTED.value
+                db.commit()
+
     return {
         "action": "capture_processed",
         "capture_id": capture_id,
         "amount": amount,
         "currency": currency,
         "transaction_id": tx.id if tx else None,
+        "purchase_request_id": purchase_request.id if purchase_request else None,
     }
 
 
@@ -201,6 +280,22 @@ def handle_refund(
     new_status = "REFUNDED"
     if db is not None:
         from app.api.budgets import reconcile_refund
+        if refund_id and parent_id:
+            tx = (
+                db.query(Transaction)
+                .filter(
+                    (Transaction.paypal_transaction_id == parent_id)
+                    | (Transaction.parent_payment_id == parent_id)
+                )
+                .first()
+            )
+            if tx and tx.refund_id == refund_id:
+                return {
+                    "action": "refund_already_reconciled",
+                    "refund_id": refund_id,
+                    "transaction_id": tx.id,
+                    "status": tx.status,
+                }
         # Ensure parent_payment_id is populated on resource if present under alias
         if not resource.get("parent_payment_id") and parent_id:
             resource["parent_payment_id"] = parent_id
@@ -312,8 +407,17 @@ async def handle_paypal_webhook(
     resource = payload.get("resource", {})
     resource_id = resource.get("id")
 
-    # 4. Idempotency Deduplication Check
-    if event_id and is_event_already_processed(event_id, db=db):
+    if not event_id:
+        raise HTTPException(status_code=400, detail="PayPal webhook event ID is missing.")
+
+    # 4. Atomically claim the event before running payment side effects.
+    if not claim_webhook_event(
+        event_id=event_id,
+        event_type=event_type,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        db=db,
+    ):
         return {
             "status": "already_processed",
             "event_id": event_id,
@@ -322,16 +426,15 @@ async def handle_paypal_webhook(
 
     # 5. Supported Event Filtering
     if not service.is_event_supported(event_type):
-        if event_id:
-            record_processed_event(
-                event_id=event_id,
-                event_type=event_type,
-                status="IGNORED",
-                resource_type=resource_type,
-                resource_id=resource_id,
-                summary=payload.get("summary"),
-                db=db,
-            )
+        record_processed_event(
+            event_id=event_id,
+            event_type=event_type,
+            status="IGNORED",
+            resource_type=resource_type,
+            resource_id=resource_id,
+            summary=payload.get("summary"),
+            db=db,
+        )
         return {
             "status": "ignored",
             "event_id": event_id,
@@ -339,19 +442,32 @@ async def handle_paypal_webhook(
         }
 
     # 6. Route to Appropriate Handler
-    result = route_webhook_event(payload, db=db)
-
-    # 7. Record as Processed
-    if event_id:
+    try:
+        result = route_webhook_event(payload, db=db)
+    except Exception as exc:
+        db.rollback()
         record_processed_event(
             event_id=event_id,
             event_type=event_type,
-            status="PROCESSED",
+            status="FAILED",
             resource_type=resource_type,
             resource_id=resource_id,
             summary=payload.get("summary"),
             db=db,
         )
+        logger.exception("PayPal webhook event %s failed during handling", event_id)
+        raise HTTPException(status_code=500, detail="PayPal webhook event processing failed.") from exc
+
+    # 7. Record as Processed
+    record_processed_event(
+        event_id=event_id,
+        event_type=event_type,
+        status="PROCESSED",
+        resource_type=resource_type,
+        resource_id=resource_id,
+        summary=payload.get("summary"),
+        db=db,
+    )
 
     return {
         "status": "processed",

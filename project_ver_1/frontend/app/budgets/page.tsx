@@ -47,7 +47,7 @@ export default function BudgetsPage() {
         <div>
           <h2 style={{ fontSize: '1.8rem', margin: '0 0 0.25rem 0', color: '#003087' }}>Virtual Envelope Budgets</h2>
           <p style={{ margin: 0, color: '#64748b', fontSize: '0.95rem' }}>
-            Allocated category balances with automated refund net-zero reconciliation.
+            Illustrative envelope and ledger examples. Live transaction and refund statuses are shown on the Transactions page.
           </p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', background: 'white', padding: '0.5rem 1rem', borderRadius: '0.5rem', border: '1px solid #cbd5e1' }}>
@@ -62,6 +62,14 @@ export default function BudgetsPage() {
             Hide refunded transactions
           </label>
         </div>
+      </div>
+
+      <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', color: '#1e40af', padding: '0.85rem 1rem', borderRadius: '0.5rem', marginBottom: '1.5rem', fontSize: '0.9rem' }}>
+        The budget values below are static examples, not live PayPal account data.{' '}
+        <a href="/transactions" style={{ color: '#003087', fontWeight: 700 }}>
+          View live transaction and refund statuses
+        </a>
+        .
       </div>
 
       {/* Progress Bars for Envelopes */}

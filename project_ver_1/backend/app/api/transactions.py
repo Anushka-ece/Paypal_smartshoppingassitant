@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.account import Account
 from app.models.transaction import Transaction
+from app.models.user import User
+from app.security.auth import get_current_user, require_family_member, require_family_parent
 from app.services.embedding_service import Tier1Classifier
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,7 @@ class TransactionResponse(BaseModel):
     id: int
     account_id: int
     paypal_transaction_id: Optional[str] = None
+    refund_id: Optional[str] = None
     amount: float
     currency: str
     status: str
@@ -55,16 +58,18 @@ def get_transactions(
     family_id: Optional[int] = Query(None),
     category: Optional[str] = Query(None),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     List transactions with filtering by account_id, family_id, and category.
     """
-    query = db.query(Transaction)
-
+    if current_user.family_id is None:
+        return []
     if family_id is not None:
-        query = query.join(Account, Transaction.account_id == Account.id).filter(
-            Account.family_id == family_id
-        )
+        require_family_member(current_user, family_id)
+    query = db.query(Transaction).join(Account, Transaction.account_id == Account.id).filter(
+        Account.family_id == current_user.family_id
+    )
 
     if account_id is not None:
         query = query.filter(Transaction.account_id == account_id)
@@ -86,16 +91,26 @@ def reclassify_transaction(
     transaction_id: int,
     payload: ReclassifyRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Reclassifies an expense and persists the custom override into the family learning cache.
     """
-    tx = db.query(Transaction).filter(Transaction.id == transaction_id).first()
+    tx = (
+        db.query(Transaction)
+        .join(Account, Transaction.account_id == Account.id)
+        .filter(Transaction.id == transaction_id, Account.family_id == current_user.family_id)
+        .first()
+    )
     if not tx:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Transaction {transaction_id} not found",
         )
+    account = db.query(Account).filter(Account.id == tx.account_id).first()
+    if account is None:
+        raise HTTPException(status_code=404, detail=f"Transaction {transaction_id} not found")
+    require_family_parent(current_user, account.family_id)
 
     # 1. Update database transaction record
     tx.category = payload.category
@@ -108,8 +123,7 @@ def reclassify_transaction(
     db.refresh(tx)
 
     # 2. Persist custom override in family learning cache
-    account = db.query(Account).filter(Account.id == tx.account_id).first()
-    family_id = account.family_id if account else None
+    family_id = account.family_id
 
     merchant_to_learn = tx.merchant_name or tx.clean_merchant_name
     if family_id and merchant_to_learn:

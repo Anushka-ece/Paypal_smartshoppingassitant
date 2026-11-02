@@ -12,12 +12,27 @@ from app.models.user import User, UserRole
 from app.models.family import Family
 from app.models.account import Account, AccountType
 from app.models.transaction import Transaction, TransactionStatus
+from app.models.paypal_oauth_state import PayPalOAuthState
 from app.models.ledger import LedgerEntry, LedgerStatus
 from app.security.crypto import encrypt_token
 from app.services.paypal_service import PayPalService, AwaitableList
 from app.workers.celery_worker import sync_historical_transactions_task
 
 client = TestClient(app)
+
+
+@pytest.fixture
+def sandbox_paypal_credentials(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.paypal_service.PAYPAL_CLIENT_ID", "test-sandbox-client-id"
+    )
+    monkeypatch.setattr(
+        "app.services.paypal_service.PAYPAL_CLIENT_SECRET", "test-sandbox-client-secret"
+    )
+    monkeypatch.setattr(
+        "app.services.paypal_service.PAYPAL_BASE_URL",
+        "https://api-m.sandbox.paypal.com",
+    )
 
 
 @pytest.fixture
@@ -39,6 +54,7 @@ def db_session():
             Account.__table__,
             Transaction.__table__,
             LedgerEntry.__table__,
+            PayPalOAuthState.__table__,
         ],
     )
     db = TestingSessionLocal()
@@ -140,7 +156,7 @@ def test_parse_transaction_record_variations():
 # ----------------------------------------------------------------------
 
 @pytest.mark.anyio
-async def test_fetch_historical_transactions_mock_and_async():
+async def test_fetch_historical_transactions_mock_and_async(sandbox_paypal_credentials):
     service = PayPalService()
 
     # Synchronous call
@@ -160,7 +176,7 @@ async def test_fetch_historical_transactions_mock_and_async():
     assert len(txs_enc) >= 3
 
 
-def test_fetch_historical_transactions_pagination():
+def test_fetch_historical_transactions_pagination(sandbox_paypal_credentials):
     service = PayPalService(client_id="live_test_client_id")
 
     page_1_data = {
@@ -220,7 +236,7 @@ def test_fetch_historical_transactions_pagination():
 # 3. Background Sync Task (Celery Worker)
 # ----------------------------------------------------------------------
 
-def test_sync_historical_transactions_task_success(db_session):
+def test_sync_historical_transactions_task_success(db_session, sandbox_paypal_credentials):
     # Setup test family, user, and account
     family = Family(name="Test Family", created_by_user_id=1)
     db_session.add(family)
@@ -271,7 +287,7 @@ def test_sync_historical_transactions_task_success(db_session):
         assert entry.transaction_id is not None
 
 
-def test_sync_historical_transactions_task_idempotency(db_session):
+def test_sync_historical_transactions_task_idempotency(db_session, sandbox_paypal_credentials):
     family = Family(name="Idempotent Family", created_by_user_id=1)
     db_session.add(family)
     db_session.commit()
@@ -323,6 +339,35 @@ def test_sync_historical_transactions_account_not_found(db_session):
     assert "not found" in res["message"]
 
 
+def test_sync_historical_transactions_without_token_fails_without_mock_data(db_session):
+    family = Family(name="Missing Token Family", created_by_user_id=1)
+    db_session.add(family)
+    db_session.commit()
+    user = User(
+        email="missing-token@example.com",
+        name="Missing Token User",
+        role=UserRole.PARENT.value,
+        family_id=family.id,
+    )
+    db_session.add(user)
+    db_session.commit()
+    account = Account(
+        user_id=user.id,
+        family_id=family.id,
+        account_type=AccountType.PAYPAL_LINKED.value,
+        paypal_encrypted_token=None,
+    )
+    db_session.add(account)
+    db_session.commit()
+
+    result = sync_historical_transactions_task(account.id, db=db_session)
+
+    assert result["status"] == "error"
+    assert "no stored access or refresh token" in result["message"]
+    assert result["synced_count"] == 0
+    assert db_session.query(Transaction).filter_by(account_id=account.id).count() == 0
+
+
 # ----------------------------------------------------------------------
 # 4. OAuth Callback Trigger Integration
 # ----------------------------------------------------------------------
@@ -347,11 +392,23 @@ def test_oauth_callback_triggers_historical_sync(db_session):
             "access_token": "mock-access-token",
             "refresh_token": "mock-refresh-token",
             "payer_id": "PAYER_9988",
+            "expires_in": 32400,
         }
+        state = "history-sync-state"
+        import hashlib
+        from datetime import timedelta
+        db_session.add(
+            PayPalOAuthState(
+                state_hash=hashlib.sha256(state.encode()).hexdigest(),
+                user_id=user.id,
+                expires_at=datetime.utcnow() + timedelta(minutes=5),
+            )
+        )
+        db_session.commit()
 
         with patch("app.services.paypal_service.PayPalService.exchange_oauth_code", return_value=fake_tokens):
             with patch("app.workers.celery_worker.sync_historical_transactions_task.delay") as mock_delay:
-                response = client.get(f"/auth/callback?code=mock_code_123&user_id={user.id}")
+                response = client.get(f"/auth/callback?code=mock_code_123&state={state}")
                 assert response.status_code == 200
                 data = response.json()
                 assert data["status"] == "success"

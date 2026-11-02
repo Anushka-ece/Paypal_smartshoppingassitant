@@ -10,7 +10,12 @@ def _get_aesgcm(key: Optional[str] = None) -> AESGCM:
     """Derives a 256-bit AES key using SHA-256 from the provided key or configured secret."""
     secret = key if key is not None else TOKEN_ENCRYPTION_KEY
     if not secret:
-        secret = "default-dev-secret-key-change-in-production-32b"
+        raise ValueError("TOKEN_ENCRYPTION_KEY must be configured before encrypting PayPal tokens.")
+    if key is None and (
+        len(secret.encode("utf-8")) < 32
+        or secret.startswith(("generate-", "default-dev", "your_", "change-me"))
+    ):
+        raise ValueError("TOKEN_ENCRYPTION_KEY must be a non-placeholder value of at least 32 bytes.")
     key_bytes = hashlib.sha256(secret.encode("utf-8")).digest()
     return AESGCM(key_bytes)
 

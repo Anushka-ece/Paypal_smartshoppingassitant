@@ -1,7 +1,10 @@
 from fastapi import FastAPI
 from app.api import auth, webhooks, transactions, guardrails, budgets, allowances, purchase_requests, family
+from app.config import validate_production_config
 from app.middleware.cors import configure_cors
 from app.middleware.security_headers import configure_security_headers
+
+validate_production_config()
 
 app = FastAPI(title="PayPal Family Budgeting API", version="1.0.0")
 

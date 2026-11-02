@@ -2,3 +2,4 @@
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
+markers = ["auth_security: exercises real authentication and authorization dependencies"]

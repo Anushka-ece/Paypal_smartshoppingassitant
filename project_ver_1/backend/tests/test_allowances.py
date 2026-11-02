@@ -1,5 +1,7 @@
+from datetime import datetime
+
 import pytest
-from unittest.mock import patch, AsyncMock
+from unittest.mock import AsyncMock
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -16,7 +18,8 @@ from app.api.allowances import (
     should_execute_allowance,
     disburse_allowance_schedule,
 )
-from app.services.paypal_service import PayPalService
+from app.api import allowances as allowance_api
+from fastapi import HTTPException
 
 client = TestClient(app)
 
@@ -68,17 +71,75 @@ def test_frozen_allowance_blocks_disbursement():
 
 
 @pytest.mark.anyio
-async def test_paypal_service_execute_payout():
-    service = PayPalService()
-    # Test mock payout execution
-    res = await service.execute_payout(
-        receiver_email="kid@example.com",
-        amount=15.00,
-        idempotency_key="mock-key-12345",
+async def test_disburse_allowance_records_only_confirmed_payout(db_session):
+    family = Family(name="Payout Family")
+    db_session.add(family)
+    db_session.commit()
+    child = User(name="Timmy", email="timmy@example.com", role=UserRole.CHILD.value, family_id=family.id)
+    db_session.add(child)
+    db_session.commit()
+    account = Account(
+        user_id=child.id,
+        family_id=family.id,
+        account_type=AccountType.CHILD_VIRTUAL.value,
+        balance=5.0,
     )
-    assert res is not None
-    assert res["status"] in ["SUCCESS", "PENDING"]
-    assert res["batch_id"] is not None
+    schedule = AllowanceSchedule(
+        family_id=family.id,
+        child_id=child.id,
+        amount=15.0,
+        currency="USD",
+    )
+    db_session.add_all([account, schedule])
+    db_session.commit()
+
+    confirmed_service = AsyncMock()
+    confirmed_service.execute_payout.return_value = {
+        "batch_id": "PAYOUT-123",
+        "status": "SUCCESS",
+    }
+    result = disburse_allowance_schedule(schedule.id, db_session, confirmed_service)
+    assert result["status"] == "SUCCESS"
+    assert account.balance == 20.0
+    assert schedule.last_payout_status == "SUCCESS"
+    assert schedule.last_payout_batch_id == "PAYOUT-123"
+    assert schedule.last_payout_date is not None
+
+    failing_service = AsyncMock()
+    failing_service.execute_payout.side_effect = RuntimeError("PayPal unavailable")
+    schedule.last_payout_date = None
+    db_session.commit()
+    with pytest.raises(HTTPException) as exc_info:
+        disburse_allowance_schedule(schedule.id, db_session, failing_service)
+    assert exc_info.value.status_code == 502
+    db_session.refresh(account)
+    db_session.refresh(schedule)
+    assert account.balance == 20.0
+    assert schedule.last_payout_status == "FAILED"
+    assert schedule.last_payout_date is None
+    assert "PayPal unavailable" in schedule.last_payout_error
+
+    pending_service = AsyncMock()
+    pending_service.execute_payout.return_value = {
+        "batch_id": "PAYOUT-PENDING",
+        "status": "PENDING",
+    }
+    pending = disburse_allowance_schedule(schedule.id, db_session, pending_service)
+    db_session.refresh(account)
+    db_session.refresh(schedule)
+    assert pending["status"] == "PENDING"
+    assert account.balance == 20.0
+    assert schedule.last_payout_status == "PENDING"
+    assert schedule.last_payout_date is None
+
+    schedule.last_payout_status = "PROCESSING"
+    schedule.last_payout_attempt_at = datetime.utcnow()
+    db_session.commit()
+    already_processing = AsyncMock()
+    with pytest.raises(HTTPException) as exc_info:
+        disburse_allowance_schedule(schedule.id, db_session, already_processing)
+    assert exc_info.value.status_code == 409
+    already_processing.execute_payout.assert_not_awaited()
 
 
 def test_allowance_freeze_and_unfreeze_api(db_session):
@@ -127,9 +188,16 @@ def test_allowance_freeze_and_unfreeze_api(db_session):
         assert unfreeze_resp.status_code == 200
         assert unfreeze_resp.json()["is_frozen"] is False
 
-        # Now disbursement succeeds
+        # Now disbursement succeeds only after an explicit PayPal success response.
+        confirmed_service = AsyncMock()
+        confirmed_service.execute_payout.return_value = {
+            "batch_id": "PAYOUT-CONFIRMED",
+            "status": "SUCCESS",
+        }
+        app.dependency_overrides[allowance_api.get_paypal_service] = lambda: confirmed_service
         disburse_success = client.post(f"/api/allowances/{data['id']}/disburse")
         assert disburse_success.status_code == 200
         assert disburse_success.json()["status"] == "SUCCESS"
     finally:
+        app.dependency_overrides.pop(allowance_api.get_paypal_service, None)
         app.dependency_overrides.pop(get_db, None)
