@@ -1,17 +1,51 @@
+
 # Python cache files
 __pycache__/
 *.py[cod]
+*.pyo
 
-# Virtual environments
+# Python virtual environments
 venv/
 .venv/
 env/
 
-# Secrets and environment variables
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
 
+# Node.js dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# Production build output
+build/
+dist/
+
+# TypeScript generated files
+*.tsbuildinfo
+
+# Python test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
 # Local configuration
 .vscode/
 .DS_Store
+Thumbs.db
+
+# Temporary and operating system files
+*.tmp
+*.swp

@@ -1,0 +1,16 @@
+﻿ project_ver_1/backend/.env.example                 |   6 +-
+ project_ver_1/backend/app/api/allowances.py        | 143 +++--
+ project_ver_1/backend/app/api/purchase_requests.py | 225 +++++++-
+ project_ver_1/backend/app/api/webhooks.py          | 246 ++++++---
+ project_ver_1/backend/app/config.py                |  11 +-
+ project_ver_1/backend/app/models/allowance.py      |   4 +
+ .../backend/app/models/purchase_request.py         |   7 +
+ .../backend/app/services/paypal_service.py         | 145 +++--
+ project_ver_1/backend/migrations/env.py            |   2 +-
+ project_ver_1/backend/tests/test_allowances.py     |  94 +++-
+ .../backend/tests/test_purchase_requests.py        | 176 ++++++
+ project_ver_1/backend/tests/test_webhooks.py       | 126 +++--
+ project_ver_1/frontend/app/hooks/use-session.ts    |   2 +-
+ project_ver_1/frontend/app/requests/page.tsx       | 604 ++++++++++++++++-----
+ project_ver_1/frontend/package.json                |  14 +-
+ 15 files changed, 1470 insertions(+), 335 deletions(-)
