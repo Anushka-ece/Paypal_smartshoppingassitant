@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useSession } from "../hooks/use-session";
 
-const apiBase = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const apiBase = process.env.NEXT_PUBLIC_API_URL ?? "";
 type Rule = { id: number; rule_text: string; created_at: string };
 
 export default function PoliciesPage() {

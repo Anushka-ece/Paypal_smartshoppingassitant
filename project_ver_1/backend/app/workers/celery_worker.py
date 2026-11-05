@@ -236,6 +236,8 @@ def sync_historical_transactions_task(account_id: int, db: Optional[Session] = N
             # Create Transaction
             new_tx = Transaction(
                 account_id=account.id,
+                family_id=account.family_id,
+                user_id=account.user_id,
                 paypal_transaction_id=paypal_tx_id,
                 amount=amount,
                 currency=currency,

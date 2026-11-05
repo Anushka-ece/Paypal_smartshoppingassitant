@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: pennypilot-ai-demo
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_URL
+        value: sqlite:///./paypal_family_budget.db
+      - key: APP_JWT_ISSUER
+        value: pennypilot
+      - key: APP_JWT_SECRET
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: ALLOWED_HOSTS
+        value: pennypilot-ai-demo.onrender.com,localhost,127.0.0.1
+      - key: ALLOWED_ORIGINS
+        value: https://pennypilot-ai-demo.onrender.com
+      - key: PAYPAL_BASE_URL
+        value: https://api-m.sandbox.paypal.com
+      - key: PAYPAL_REDIRECT_URI
+        value: https://pennypilot-ai-demo.onrender.com/api/auth/paypal/callback
+      - key: PAYPAL_CHECKOUT_RETURN_URL
+        value: https://pennypilot-ai-demo.onrender.com/requests?checkout=return&request_id={request_id}
+      - key: PAYPAL_CHECKOUT_CANCEL_URL
+        value: https://pennypilot-ai-demo.onrender.com/requests?checkout=cancel&request_id={request_id}
+      - key: PAYPAL_ALLOW_MOCK_WEBHOOKS
+        value: "false"
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_WEBHOOK_ID
+        value: pending-webhook-setup
+      - key: GEMINI_API_KEY
+        sync: false

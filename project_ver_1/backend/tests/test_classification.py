@@ -246,6 +246,8 @@ def test_api_get_transactions(db_session):
 
         tx1 = Transaction(
             account_id=account.id,
+            family_id=family.id,
+            user_id=user.id,
             paypal_transaction_id="TX-1001",
             amount=15.00,
             merchant_name="UBER",
@@ -257,6 +259,8 @@ def test_api_get_transactions(db_session):
         )
         tx2 = Transaction(
             account_id=account.id,
+            family_id=family.id,
+            user_id=user.id,
             paypal_transaction_id="TX-1002",
             amount=25.00,
             merchant_name="NETFLIX",
@@ -299,6 +303,8 @@ def test_api_reclassify_transaction_and_learn_loop(db_session):
 
         tx = Transaction(
             account_id=account.id,
+            family_id=family.id,
+            user_id=user.id,
             paypal_transaction_id="TX-LEARN-01",
             amount=45.00,
             merchant_name="Neighborhood Hardware",

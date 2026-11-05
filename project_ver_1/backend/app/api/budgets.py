@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -143,11 +144,22 @@ def create_envelope(
 ):
     """Create a new virtual budget envelope."""
     require_family_parent(current_user, payload.family_id)
+    name = payload.name.strip()
+    existing_spend = (
+        db.query(func.coalesce(func.sum(Transaction.amount), 0.0))
+        .join(Account, Transaction.account_id == Account.id)
+        .filter(
+            Account.family_id == payload.family_id,
+            func.lower(Transaction.category) == name.lower(),
+            Transaction.status == TransactionStatus.COMPLETED.value,
+        )
+        .scalar()
+    )
     envelope = BudgetEnvelope(
         family_id=payload.family_id,
-        name=payload.name.strip(),
+        name=name,
         allocated_amount=payload.allocated_amount,
-        current_spent=0.0,
+        current_spent=float(existing_spend or 0.0),
         currency=payload.currency or "USD",
     )
     db.add(envelope)

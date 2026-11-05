@@ -1,9 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { useSession } from "../hooks/use-session";
 
-const apiBase = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const apiBase = process.env.NEXT_PUBLIC_API_URL ?? "";
 type Item = {
   id: number;
   merchant_name: string | null;
@@ -25,6 +25,11 @@ export default function TransactionsPage() {
   const { session, ready } = useSession();
   const [familyIdInput, setFamilyIdInput] = useState("");
   const [items, setItems] = useState<Item[]>([]);
+  const [merchantName, setMerchantName] = useState("");
+  const [amount, setAmount] = useState("");
+  const [category, setCategory] = useState("Food & Dining");
+  const [description, setDescription] = useState("");
+  const [savingExpense, setSavingExpense] = useState(false);
   const [statusFilter, setStatusFilter] = useState("ALL");
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -36,6 +41,7 @@ export default function TransactionsPage() {
 
   const familyId = session?.family_id ?? Number(familyIdInput);
   const validFamilyId = Number.isInteger(familyId) && familyId > 0;
+  const isParent = session?.role.toUpperCase() === "PARENT" || session?.role.toUpperCase() === "CO_PARENT";
 
   const loadTransactions = useCallback(async () => {
     if (!session?.token) {
@@ -85,6 +91,59 @@ export default function TransactionsPage() {
     }
   }, [familyId, session?.token, validFamilyId]);
 
+  async function addExpense(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!session?.token || !validFamilyId) {
+      setError("Sign in to record an expense for your family.");
+      return;
+    }
+
+    setSavingExpense(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await fetch(`${apiBase}/api/transactions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${session.token}`,
+        },
+        body: JSON.stringify({
+          merchant_name: merchantName,
+          amount: Number(amount),
+          currency: "USD",
+          category,
+          description,
+        }),
+      });
+      const data: unknown = await response.json();
+      if (!response.ok) {
+        const detail =
+          typeof data === "object" &&
+          data !== null &&
+          "detail" in data &&
+          typeof data.detail === "string"
+            ? data.detail
+            : "Unable to record this expense.";
+        throw new Error(detail);
+      }
+
+      setMerchantName("");
+      setAmount("");
+      setDescription("");
+      await loadTransactions();
+      setNotice("Expense saved to your family transaction history.");
+    } catch (saveError) {
+      setError(
+        saveError instanceof Error
+          ? saveError.message
+          : "Unable to connect to the transaction service.",
+      );
+    } finally {
+      setSavingExpense(false);
+    }
+  }
+
   useEffect(() => {
     if (ready && session?.token && validFamilyId) void loadTransactions();
     else if (ready && !session?.token) setError("Sign in to view family transactions.");
@@ -123,6 +182,35 @@ export default function TransactionsPage() {
         <div role="alert" style={{ background: "#fff7e8", color: "#82551c", padding: "0.8rem 1rem", borderRadius: 10, margin: "1rem 0" }}>
           <a href="/login" style={{ color: "#82551c", fontWeight: 700 }}>Sign in</a> to view family transaction statuses.
         </div>
+      )}
+
+      {session?.token && isParent && (
+        <form
+          onSubmit={addExpense}
+          style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", alignItems: "end", gap: 12, background: "white", border: "1px solid #e2e8f0", borderRadius: 12, padding: 16, margin: "1rem 0" }}
+        >
+          <label style={{ display: "grid", gap: 6, color: "#64748b", fontSize: 14 }}>
+            Merchant
+            <input required maxLength={255} value={merchantName} onChange={(event) => setMerchantName(event.target.value)} placeholder="e.g. Grocery store" style={{ border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.65rem 0.75rem" }} />
+          </label>
+          <label style={{ display: "grid", gap: 6, color: "#64748b", fontSize: 14 }}>
+            Amount (USD)
+            <input required min="0.01" step="0.01" type="number" value={amount} onChange={(event) => setAmount(event.target.value)} placeholder="0.00" style={{ border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.65rem 0.75rem" }} />
+          </label>
+          <label style={{ display: "grid", gap: 6, color: "#64748b", fontSize: 14 }}>
+            Category
+            <select value={category} onChange={(event) => setCategory(event.target.value)} style={{ border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.65rem 0.75rem", background: "white" }}>
+              {["Food & Dining", "Groceries", "Transport", "Shopping", "Gaming", "Entertainment", "Health", "Education", "Other"].map((item) => <option key={item}>{item}</option>)}
+            </select>
+          </label>
+          <label style={{ display: "grid", gap: 6, color: "#64748b", fontSize: 14 }}>
+            Note (optional)
+            <input maxLength={1000} value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What was this expense for?" style={{ border: "1px solid #cbd5e1", borderRadius: 8, padding: "0.65rem 0.75rem" }} />
+          </label>
+          <button type="submit" className="button" disabled={savingExpense || !validFamilyId}>
+            {savingExpense ? "Saving…" : "Add expense"}
+          </button>
+        </form>
       )}
 
       {session?.token && !session.family_id && (

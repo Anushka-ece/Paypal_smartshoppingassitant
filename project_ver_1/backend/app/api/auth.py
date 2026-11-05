@@ -60,6 +60,15 @@ def register_parent(payload: ParentRegistration, db: Session = Depends(get_db)):
     db.add(parent)
     db.flush()
     family.created_by_user_id = parent.id
+    db.add(
+        Account(
+            user_id=parent.id,
+            family_id=family.id,
+            account_type=AccountType.PARENT_WALLET.value,
+            balance=0.0,
+            currency="USD",
+        )
+    )
     db.commit()
     db.refresh(parent)
     return {"status": "pending_verification", "user_id": parent.id, "family_id": family.id}

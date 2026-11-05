@@ -220,6 +220,8 @@ def handle_capture_completed(
         if not tx and account:
             tx = Transaction(
                 account_id=account.id,
+                family_id=account.family_id,
+                user_id=account.user_id,
                 paypal_transaction_id=capture_id,
                 amount=amount,
                 currency=currency,

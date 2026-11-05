@@ -213,14 +213,22 @@ def test_api_webhook_invalid_signature_returns_400():
 # ----------------------------------------------------------------------
 
 def test_webhook_routing_capture_completed(db_session, valid_headers):
-    # Setup account in DB
-    user = User(email="parent_wh@example.com", name="WH Parent", role=UserRole.PARENT.value)
+    family = Family(name="Capture Webhook Family")
+    db_session.add(family)
+    db_session.commit()
+    user = User(
+        email="parent_wh@example.com",
+        name="WH Parent",
+        role=UserRole.PARENT.value,
+        family_id=family.id,
+    )
     db_session.add(user)
     db_session.commit()
     db_session.refresh(user)
 
     account = Account(
         user_id=user.id,
+        family_id=family.id,
         account_type=AccountType.PAYPAL_LINKED.value,
         paypal_account_id="ACC_PAYEE_123",
         balance=100.0,
@@ -309,11 +317,23 @@ def test_capture_webhook_completes_linked_purchase_request(db_session, valid_hea
 
 
 def test_webhook_idempotency_duplicate_event_returns_200_without_reprocessing(db_session, valid_headers):
-    # Setup account
-    user = User(email="idemp@example.com", name="Idemp User", role=UserRole.PARENT.value)
+    family = Family(name="Idempotency Webhook Family")
+    db_session.add(family)
+    db_session.commit()
+    user = User(
+        email="idemp@example.com",
+        name="Idemp User",
+        role=UserRole.PARENT.value,
+        family_id=family.id,
+    )
     db_session.add(user)
     db_session.commit()
-    account = Account(user_id=user.id, account_type=AccountType.PAYPAL_LINKED.value, balance=50.0)
+    account = Account(
+        user_id=user.id,
+        family_id=family.id,
+        account_type=AccountType.PAYPAL_LINKED.value,
+        balance=50.0,
+    )
     db_session.add(account)
     db_session.commit()
     db_session.refresh(account)
@@ -357,16 +377,21 @@ def test_webhook_idempotency_duplicate_event_returns_200_without_reprocessing(db
 
 def test_webhook_routing_refund(db_session, valid_headers):
     # Setup account and original transaction
-    user = User(email="refund@example.com", name="Refund User", role=UserRole.PARENT.value)
+    family = Family(name="Refund Family")
+    db_session.add(family)
+    db_session.commit()
+    user = User(email="refund@example.com", name="Refund User", role=UserRole.PARENT.value, family_id=family.id)
     db_session.add(user)
     db_session.commit()
-    account = Account(user_id=user.id, account_type=AccountType.PAYPAL_LINKED.value)
+    account = Account(user_id=user.id, family_id=family.id, account_type=AccountType.PAYPAL_LINKED.value)
     db_session.add(account)
     db_session.commit()
     db_session.refresh(account)
 
     original_tx = Transaction(
         account_id=account.id,
+        family_id=family.id,
+        user_id=user.id,
         paypal_transaction_id="CAP-ORIG-REFUND",
         amount=60.00,
         currency="USD",
@@ -423,16 +448,21 @@ def test_webhook_routing_refund(db_session, valid_headers):
 
 
 def test_webhook_routing_dispute_resolved(db_session, valid_headers):
-    user = User(email="dispute@example.com", name="Dispute User", role=UserRole.PARENT.value)
+    family = Family(name="Dispute Family")
+    db_session.add(family)
+    db_session.commit()
+    user = User(email="dispute@example.com", name="Dispute User", role=UserRole.PARENT.value, family_id=family.id)
     db_session.add(user)
     db_session.commit()
-    account = Account(user_id=user.id, account_type=AccountType.PAYPAL_LINKED.value)
+    account = Account(user_id=user.id, family_id=family.id, account_type=AccountType.PAYPAL_LINKED.value)
     db_session.add(account)
     db_session.commit()
     db_session.refresh(account)
 
     tx = Transaction(
         account_id=account.id,
+        family_id=family.id,
+        user_id=user.id,
         paypal_transaction_id="CAP-DISPUTED-TX",
         amount=99.99,
         currency="USD",
