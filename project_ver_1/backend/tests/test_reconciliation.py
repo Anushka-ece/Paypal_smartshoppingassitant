@@ -84,6 +84,8 @@ def test_refund_reconciliation_full(db_session):
     # Create original transaction
     tx = Transaction(
         account_id=account.id,
+        family_id=family.id,
+        user_id=user.id,
         paypal_transaction_id="TX-CAPTURE-999",
         amount=50.00,
         merchant_name="Steam",
@@ -134,6 +136,8 @@ def test_refund_reconciliation_partial(db_session):
 
     tx = Transaction(
         account_id=account.id,
+        family_id=family.id,
+        user_id=user.id,
         paypal_transaction_id="TX-CAPTURE-PARTIAL",
         amount=150.00,
         merchant_name="Apple Store",

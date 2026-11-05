@@ -92,6 +92,8 @@ def test_models_instantiation():
 
     tx = Transaction(
         account_id=1,
+        family_id=1,
+        user_id=1,
         paypal_transaction_id="TX9988",
         amount=25.0,
         status=TransactionStatus.COMPLETED.value,

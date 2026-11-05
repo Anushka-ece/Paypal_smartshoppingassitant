@@ -1,221 +1,161 @@
-'use client';
+"use client";
 
-import React, { useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useSession } from "../hooks/use-session";
+
+const apiBase = process.env.NEXT_PUBLIC_API_URL ?? "";
 
 interface TransactionItem {
   id: number;
-  merchant: string;
+  merchant_name: string | null;
+  clean_merchant_name: string | null;
   amount: number;
-  category: string;
-  child: string;
-  isFlagged: boolean;
-  flagReason?: string;
+  currency: string;
+  category: string | null;
   status: string;
+  is_flagged: boolean;
+  flagged_reason: string | null;
+  created_at: string | null;
 }
 
 export default function DashboardPage() {
-  const [transactions, setTransactions] = useState<TransactionItem[]>([
-    {
-      id: 101,
-      merchant: 'Epic Games *Fortnite',
-      amount: 49.99,
-      category: 'Gaming',
-      child: 'Bart Simpson',
-      isFlagged: true,
-      flagReason: 'Rule Matched: In-game purchase exceeding $25 threshold',
-      status: 'FLAGGED',
-    },
-    {
-      id: 102,
-      merchant: 'G2A Marketplace',
-      amount: 19.99,
-      category: 'Gaming',
-      child: 'Bart Simpson',
-      isFlagged: true,
-      flagReason: 'Threat Blacklist: Grey-market digital game key marketplace',
-      status: 'FLAGGED',
-    },
-    {
-      id: 103,
-      merchant: 'Starbucks Coffee',
-      amount: 5.75,
-      category: 'Food & Dining',
-      child: 'Lisa Simpson',
-      isFlagged: false,
-      status: 'COMPLETED',
-    },
-    {
-      id: 104,
-      merchant: 'Uber *Trip',
-      amount: 16.50,
-      category: 'Transport',
-      child: 'Lisa Simpson',
-      isFlagged: false,
-      status: 'COMPLETED',
-    },
-  ]);
+  const { session, ready } = useSession();
+  const [transactions, setTransactions] = useState<TransactionItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const [message, setMessage] = useState<string | null>(null);
+  const loadTransactions = useCallback(async () => {
+    if (!session?.token || !session.family_id) {
+      setError("Sign in to view your family's financial activity.");
+      return;
+    }
 
-  const handleApprove = (id: number) => {
-    setTransactions((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, isFlagged: false, status: 'COMPLETED' } : t))
-    );
-    setMessage(`Transaction #${id} approved by parent.`);
-  };
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `${apiBase}/api/transactions?family_id=${session.family_id}&limit=50`,
+        {
+          headers: { Authorization: `Bearer ${session.token}` },
+          cache: "no-store",
+        },
+      );
+      const data: unknown = await response.json();
+      if (!response.ok) {
+        const detail =
+          typeof data === "object" &&
+          data !== null &&
+          "detail" in data &&
+          typeof data.detail === "string"
+            ? data.detail
+            : "Unable to load family transactions.";
+        throw new Error(detail);
+      }
+      if (!Array.isArray(data)) {
+        throw new Error("The transaction service returned an invalid response.");
+      }
+      setTransactions(data as TransactionItem[]);
+    } catch (loadError) {
+      setError(
+        loadError instanceof Error
+          ? loadError.message
+          : "Unable to connect to the transaction service.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, [session?.family_id, session?.token]);
 
-  const handleFlagForReview = (id: number) => {
-    setTransactions((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, status: 'NEEDS_EXPLANATION' } : t))
-    );
-    setMessage(`Requested receipt upload and explanation from child for Transaction #${id}.`);
-  };
+  useEffect(() => {
+    if (ready && session?.token) void loadTransactions();
+    else if (ready) setError("Sign in to view your family's financial activity.");
+  }, [ready, session?.token, loadTransactions]);
 
-  const handleDisputeAndFreeze = (id: number) => {
-    setTransactions((prev) =>
-      prev.map((t) => (t.id === id ? { ...t, status: 'DISPUTED_AND_FROZEN' } : t))
-    );
-    setMessage(`Dispute initiated! Upcoming allowances frozen. Redirecting to PayPal Resolution Center...`);
-    window.open('https://www.paypal.com/disputes/', '_blank');
-  };
+  const summary = useMemo(
+    () => ({
+      total: transactions.reduce((sum, item) => sum + item.amount, 0),
+      completed: transactions.filter((item) => item.status === "COMPLETED").length,
+      refunds: transactions.filter(
+        (item) => item.status === "REFUNDED" || item.status === "PARTIALLY_REFUNDED",
+      ).length,
+      flagged: transactions.filter((item) => item.is_flagged).length,
+    }),
+    [transactions],
+  );
 
   return (
-    <div>
-      <h2 style={{ fontSize: '1.8rem', margin: '0 0 1.5rem 0', color: '#003087' }}>Parent Financial Overview</h2>
+    <main>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: "1.5rem" }}>
+        <div>
+          <h1 style={{ fontSize: "1.8rem", margin: "0 0 0.4rem", color: "#003087" }}>Family financial overview</h1>
+          <p style={{ margin: 0, color: "#64748b" }}>A live summary of expenses and transaction statuses recorded for your family.</p>
+        </div>
+        <a href="/transactions" className="button">Record an expense</a>
+      </div>
 
-      {message && (
-        <div style={{ backgroundColor: '#ecfdf5', border: '1px solid #10b981', color: '#065f46', padding: '0.75rem 1rem', borderRadius: '0.5rem', marginBottom: '1.5rem' }}>
-          {message}
+      {!session?.token && ready && (
+        <div role="alert" style={{ background: "#fff7e8", color: "#82551c", padding: "0.8rem 1rem", borderRadius: "0.5rem", marginBottom: "1.5rem" }}>
+          <a href="/login" style={{ color: "#82551c", fontWeight: 700 }}>Sign in</a> to see your family's live financial summary.
+        </div>
+      )}
+      {error && session?.token && (
+        <div role="alert" style={{ background: "#fef2f2", border: "1px solid #fecaca", color: "#991b1b", padding: "0.8rem 1rem", borderRadius: "0.5rem", marginBottom: "1.5rem" }}>
+          {error}
         </div>
       )}
 
-      {/* Metrics Row */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem', marginBottom: '2rem' }}>
-        <div style={{ background: 'white', padding: '1.25rem', borderRadius: '0.5rem', border: '1px solid #e2e8f0' }}>
-          <div style={{ color: '#64748b', fontSize: '0.85rem', fontWeight: 600 }}>TOTAL FAMILY SPEND</div>
-          <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#003087', marginTop: '0.25rem' }}>$412.50</div>
-        </div>
-        <div style={{ background: 'white', padding: '1.25rem', borderRadius: '0.5rem', border: '1px solid #e2e8f0' }}>
-          <div style={{ color: '#64748b', fontSize: '0.85rem', fontWeight: 600 }}>PARENT WALLET BALANCE</div>
-          <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#10b981', marginTop: '0.25rem' }}>$1,250.00</div>
-        </div>
-        <div style={{ background: 'white', padding: '1.25rem', borderRadius: '0.5rem', border: '1px solid #e2e8f0' }}>
-          <div style={{ color: '#64748b', fontSize: '0.85rem', fontWeight: 600 }}>CHILD ALLOWANCE POOL</div>
-          <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#0284c7', marginTop: '0.25rem' }}>$75.00</div>
-        </div>
-        <div style={{ background: 'white', padding: '1.25rem', borderRadius: '0.5rem', border: '1px solid #e2e8f0' }}>
-          <div style={{ color: '#64748b', fontSize: '0.85rem', fontWeight: 600 }}>FLAGGED INCIDENTS</div>
-          <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#ef4444', marginTop: '0.25rem' }}>
-            {transactions.filter((t) => t.isFlagged).length}
+      <section aria-label="Family financial summary" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "1rem", marginBottom: "2rem" }}>
+        {[
+          { label: "RECORDED EXPENSES", value: new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(summary.total), color: "#003087" },
+          { label: "TRANSACTIONS", value: transactions.length, color: "#0284c7" },
+          { label: "REFUNDED / PARTIAL", value: summary.refunds, color: "#b45309" },
+          { label: "FLAGGED FOR REVIEW", value: summary.flagged, color: "#b91c1c" },
+        ].map((stat) => (
+          <div key={stat.label} style={{ background: "white", padding: "1.25rem", borderRadius: "0.5rem", border: "1px solid #e2e8f0" }}>
+            <div style={{ color: "#64748b", fontSize: "0.85rem", fontWeight: 600 }}>{stat.label}</div>
+            <div style={{ fontSize: "1.75rem", fontWeight: 800, color: stat.color, marginTop: "0.25rem" }}>{stat.value}</div>
           </div>
-        </div>
+        ))}
+      </section>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: "1rem" }}>
+        <h2 style={{ fontSize: "1.3rem", color: "#003087", margin: 0 }}>Recent family activity</h2>
+        <button type="button" className="button" onClick={() => void loadTransactions()} disabled={loading}>
+          {loading ? "Refreshing…" : "Refresh"}
+        </button>
       </div>
 
-      {/* Flagged Incidents Alert Section */}
-      <h3 style={{ fontSize: '1.3rem', color: '#991b1b', marginBottom: '1rem' }}>🚨 Flagged Transaction Alerts Requiring Attention</h3>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginBottom: '2.5rem' }}>
-        {transactions.filter((t) => t.isFlagged).length === 0 ? (
-          <div style={{ background: 'white', padding: '1.5rem', borderRadius: '0.5rem', border: '1px dashed #cbd5e1', textAlign: 'center', color: '#64748b' }}>
-            ✅ No flagged transactions. All child spending complies with parent guardrails.
-          </div>
-        ) : (
-          transactions
-            .filter((t) => t.isFlagged)
-            .map((t) => (
-              <div
-                key={t.id}
-                style={{
-                  background: '#fff',
-                  borderLeft: '5px solid #ef4444',
-                  border: '1px solid #fed7aa',
-                  borderRadius: '0.5rem',
-                  padding: '1.25rem',
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  flexWrap: 'wrap',
-                  gap: '1rem',
-                }}
-              >
-                <div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                    <span style={{ fontWeight: 700, fontSize: '1.1rem' }}>{t.merchant}</span>
-                    <span style={{ background: '#fee2e2', color: '#991b1b', fontSize: '0.75rem', padding: '0.2rem 0.5rem', borderRadius: '0.25rem', fontWeight: 700 }}>
-                      HIGH RISK
-                    </span>
-                  </div>
-                  <div style={{ color: '#64748b', fontSize: '0.9rem', marginTop: '0.25rem' }}>
-                    Spender: <strong>{t.child}</strong> | Amount: <strong style={{ color: '#0f172a' }}>${t.amount.toFixed(2)}</strong> | Category: {t.category}
-                  </div>
-                  <div style={{ color: '#b91c1c', fontSize: '0.85rem', marginTop: '0.5rem', fontWeight: 500 }}>
-                    ⚠️ {t.flagReason}
-                  </div>
-                </div>
-
-                <div style={{ display: 'flex', gap: '0.5rem' }}>
-                  <button
-                    onClick={() => handleApprove(t.id)}
-                    style={{ background: '#10b981', color: 'white', border: 'none', padding: '0.5rem 0.85rem', borderRadius: '0.375rem', fontWeight: 600, cursor: 'pointer' }}
-                  >
-                    [Approve]
-                  </button>
-                  <button
-                    onClick={() => handleFlagForReview(t.id)}
-                    style={{ background: '#f59e0b', color: 'white', border: 'none', padding: '0.5rem 0.85rem', borderRadius: '0.375rem', fontWeight: 600, cursor: 'pointer' }}
-                  >
-                    [Flag for Review]
-                  </button>
-                  <button
-                    onClick={() => handleDisputeAndFreeze(t.id)}
-                    style={{ background: '#ef4444', color: 'white', border: 'none', padding: '0.5rem 0.85rem', borderRadius: '0.375rem', fontWeight: 600, cursor: 'pointer' }}
-                  >
-                    [Dispute / Freeze]
-                  </button>
-                </div>
-              </div>
-            ))
-        )}
-      </div>
-
-      {/* Recent Transactions Ledger */}
-      <h3 style={{ fontSize: '1.3rem', color: '#003087', marginBottom: '1rem' }}>All Recent Family Transactions</h3>
-      <div style={{ background: 'white', borderRadius: '0.5rem', border: '1px solid #e2e8f0', overflow: 'hidden' }}>
-        <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', fontSize: '0.95rem' }}>
+      <section style={{ background: "white", borderRadius: "0.5rem", border: "1px solid #e2e8f0", overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", fontSize: "0.95rem" }}>
           <thead>
-            <tr style={{ background: '#f8fafc', borderBottom: '1px solid #e2e8f0', color: '#64748b' }}>
-              <th style={{ padding: '0.75rem 1rem' }}>Merchant</th>
-              <th style={{ padding: '0.75rem 1rem' }}>Family Member</th>
-              <th style={{ padding: '0.75rem 1rem' }}>Category</th>
-              <th style={{ padding: '0.75rem 1rem' }}>Amount</th>
-              <th style={{ padding: '0.75rem 1rem' }}>Status</th>
+            <tr style={{ background: "#f8fafc", borderBottom: "1px solid #e2e8f0", color: "#64748b" }}>
+              <th style={{ padding: "0.75rem 1rem" }}>Merchant</th>
+              <th style={{ padding: "0.75rem 1rem" }}>Category</th>
+              <th style={{ padding: "0.75rem 1rem" }}>Amount</th>
+              <th style={{ padding: "0.75rem 1rem" }}>Status</th>
+              <th style={{ padding: "0.75rem 1rem" }}>Date</th>
             </tr>
           </thead>
           <tbody>
-            {transactions.map((t) => (
-              <tr key={t.id} style={{ borderBottom: '1px solid #f1f5f9' }}>
-                <td style={{ padding: '0.75rem 1rem', fontWeight: 600 }}>{t.merchant}</td>
-                <td style={{ padding: '0.75rem 1rem' }}>{t.child}</td>
-                <td style={{ padding: '0.75rem 1rem' }}>{t.category}</td>
-                <td style={{ padding: '0.75rem 1rem', fontWeight: 700 }}>${t.amount.toFixed(2)}</td>
-                <td style={{ padding: '0.75rem 1rem' }}>
-                  <span
-                    style={{
-                      padding: '0.2rem 0.5rem',
-                      borderRadius: '0.25rem',
-                      fontSize: '0.8rem',
-                      fontWeight: 600,
-                      background: t.status === 'COMPLETED' ? '#dcfce7' : t.status === 'FLAGGED' ? '#fee2e2' : '#fef3c7',
-                      color: t.status === 'COMPLETED' ? '#15803d' : t.status === 'FLAGGED' ? '#b91c1c' : '#b45309',
-                    }}
-                  >
-                    {t.status}
-                  </span>
-                </td>
+            {!loading && transactions.length === 0 && (
+              <tr><td colSpan={5} style={{ padding: "1rem", color: "#64748b" }}>No expenses recorded yet. <a href="/transactions">Add your first expense</a>.</td></tr>
+            )}
+            {transactions.map((transaction) => (
+              <tr key={transaction.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                <td style={{ padding: "0.75rem 1rem", fontWeight: 600 }}>{transaction.clean_merchant_name || transaction.merchant_name || "Expense"}</td>
+                <td style={{ padding: "0.75rem 1rem" }}>{transaction.category || "Uncategorized"}</td>
+                <td style={{ padding: "0.75rem 1rem", fontWeight: 700 }}>{new Intl.NumberFormat(undefined, { style: "currency", currency: transaction.currency }).format(transaction.amount)}</td>
+                <td style={{ padding: "0.75rem 1rem" }}>{transaction.is_flagged ? "FLAGGED" : transaction.status}</td>
+                <td style={{ padding: "0.75rem 1rem", color: "#64748b" }}>{transaction.created_at ? new Date(transaction.created_at).toLocaleDateString() : "—"}</td>
               </tr>
             ))}
           </tbody>
         </table>
-      </div>
-    </div>
+      </section>
+
+      <p style={{ color: "#64748b", fontSize: 13, marginTop: "1rem" }}>
+        {summary.completed} completed transaction{summary.completed === 1 ? "" : "s"} recorded. The dashboard reflects backend data; it does not display a live PayPal balance.
+      </p>
+    </main>
   );
 }

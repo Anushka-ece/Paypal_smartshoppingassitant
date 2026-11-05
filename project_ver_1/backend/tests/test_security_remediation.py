@@ -13,6 +13,7 @@ from app.database import Base, get_db
 from app.main import app
 from app.api import auth as auth_api
 from app.models.account import Account, AccountType
+from app.models.budget import BudgetEnvelope
 from app.models.family import Family
 from app.models.paypal_oauth_state import PayPalOAuthState
 from app.models.purchase_request import PurchaseRequest, PurchaseRequestStatus
@@ -136,12 +137,16 @@ def test_family_transactions_refunds_and_purchases_are_scoped(security_context):
     db.flush()
     transaction_a = Transaction(
         account_id=account_a.id,
+        family_id=family_a.id,
+        user_id=parent_a.id,
         paypal_transaction_id="TX-FAMILY-A",
         amount=10,
         status=TransactionStatus.COMPLETED.value,
     )
     transaction_b = Transaction(
         account_id=account_b.id,
+        family_id=family_b.id,
+        user_id=parent_b.id,
         paypal_transaction_id="TX-FAMILY-B-REFUND",
         amount=50,
         status=TransactionStatus.REFUNDED.value,
@@ -373,3 +378,93 @@ def test_oauth_state_is_single_use_and_expiration_is_enforced(security_context):
         expired = client.get(f"/api/auth/paypal/callback?code=expired&state={expired_state}")
     assert expired.status_code == 400
     exchange.assert_not_awaited()
+
+
+def test_parent_can_record_family_expense_and_update_matching_budget(security_context):
+    db, client = security_context
+    family, parent = create_family_and_user(db, "Expense Demo", "expense-demo@example.test")
+    envelope = BudgetEnvelope(
+        family_id=family.id,
+        name="Food & Dining",
+        allocated_amount=200,
+        current_spent=10,
+    )
+    db.add(envelope)
+    db.commit()
+
+    response = client.post(
+        "/api/transactions",
+        headers=auth_headers(parent),
+        json={
+            "merchant_name": "Neighborhood Market",
+            "amount": 24.5,
+            "currency": "USD",
+            "category": "Food & Dining",
+            "description": "Family groceries",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["merchant_name"] == "Neighborhood Market"
+    assert response.json()["amount"] == 24.5
+    db.refresh(envelope)
+    assert envelope.current_spent == 34.5
+
+    family_transactions = client.get(
+        f"/api/transactions?family_id={family.id}",
+        headers=auth_headers(parent),
+    )
+    assert family_transactions.status_code == 200
+    assert len(family_transactions.json()) == 1
+
+
+def test_budget_created_after_expense_includes_existing_category_spend(security_context):
+    db, client = security_context
+    family, parent = create_family_and_user(db, "Historical Spend", "historical-spend@example.test")
+    headers = auth_headers(parent)
+    expense = client.post(
+        "/api/transactions",
+        headers=headers,
+        json={
+            "merchant_name": "Neighborhood Market",
+            "amount": 24.5,
+            "currency": "USD",
+            "category": "Groceries",
+        },
+    )
+    assert expense.status_code == 201
+
+    budget = client.post(
+        "/api/budgets/envelopes",
+        headers=headers,
+        json={
+            "family_id": family.id,
+            "name": "Groceries",
+            "allocated_amount": 100,
+            "currency": "USD",
+        },
+    )
+    assert budget.status_code == 200
+    assert budget.json()["current_spent"] == 24.5
+
+
+def test_child_cannot_create_family_expense(security_context):
+    db, client = security_context
+    family, child = create_family_and_user(
+        db,
+        "Child Expense",
+        "child-expense@example.test",
+        UserRole.CHILD.value,
+    )
+    response = client.post(
+        "/api/transactions",
+        headers=auth_headers(child),
+        json={
+            "merchant_name": "Online Store",
+            "amount": 12,
+            "currency": "USD",
+            "category": "Shopping",
+        },
+    )
+    assert response.status_code == 403
+    assert db.query(Transaction).count() == 0

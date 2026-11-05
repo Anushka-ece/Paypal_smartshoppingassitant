@@ -3,12 +3,13 @@ from typing import List, Optional
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.account import Account
-from app.models.transaction import Transaction
+from app.models.account import Account, AccountType
+from app.models.budget import BudgetEnvelope
+from app.models.transaction import Transaction, TransactionStatus
 from app.models.user import User
 from app.security.auth import get_current_user, require_family_member, require_family_parent
 from app.services.embedding_service import Tier1Classifier
@@ -25,6 +26,14 @@ class ReclassifyRequest(BaseModel):
     subcategory: Optional[str] = None
     merchant_clean_name: Optional[str] = None
     notes: Optional[str] = None
+
+
+class ExpenseCreate(BaseModel):
+    merchant_name: str = Field(min_length=1, max_length=255)
+    amount: float = Field(gt=0)
+    currency: str = Field(default="USD", min_length=3, max_length=3, pattern="^[A-Za-z]{3}$")
+    category: str = Field(min_length=1, max_length=100)
+    description: Optional[str] = Field(default=None, max_length=1000)
 
 
 class TransactionResponse(BaseModel):
@@ -47,6 +56,73 @@ class TransactionResponse(BaseModel):
     flagged_reason: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+@router.post("", response_model=TransactionResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=TransactionResponse, status_code=status.HTTP_201_CREATED)
+def create_expense(
+    payload: ExpenseCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Record a family expense and update a matching category envelope."""
+    if current_user.family_id is None:
+        raise HTTPException(status_code=404, detail="Family not found.")
+    require_family_parent(current_user, current_user.family_id)
+
+    merchant_name = payload.merchant_name.strip()
+    category = payload.category.strip()
+    if not merchant_name or not category:
+        raise HTTPException(status_code=422, detail="Merchant and category are required.")
+
+    account = (
+        db.query(Account)
+        .filter(
+            Account.user_id == current_user.id,
+            Account.family_id == current_user.family_id,
+            Account.account_type == AccountType.PARENT_WALLET.value,
+        )
+        .first()
+    )
+    if account is None:
+        account = Account(
+            user_id=current_user.id,
+            family_id=current_user.family_id,
+            account_type=AccountType.PARENT_WALLET.value,
+            balance=0.0,
+            currency=payload.currency.upper(),
+        )
+        db.add(account)
+        db.flush()
+
+    transaction = Transaction(
+        account_id=account.id,
+        family_id=current_user.family_id,
+        user_id=current_user.id,
+        amount=payload.amount,
+        currency=payload.currency.upper(),
+        status=TransactionStatus.COMPLETED.value,
+        merchant_name=merchant_name,
+        clean_merchant_name=merchant_name,
+        category=category,
+        description=payload.description.strip() if payload.description else None,
+    )
+    db.add(transaction)
+
+    envelope = (
+        db.query(BudgetEnvelope)
+        .filter(
+            BudgetEnvelope.family_id == current_user.family_id,
+            BudgetEnvelope.name.ilike(category),
+        )
+        .first()
+    )
+    if envelope:
+        envelope.current_spent += payload.amount
+
+    db.commit()
+    db.refresh(transaction)
+    return transaction
 
 
 @router.get("", response_model=List[TransactionResponse])

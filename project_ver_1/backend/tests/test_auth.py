@@ -404,6 +404,16 @@ def test_parent_registration_and_login_flow(db_session):
         registered_user = db_session.query(User).filter_by(email="marge@example.com").one()
         assert registered_user.hashed_password.startswith("$argon2")
         assert registered_user.hashed_password != reg_payload["password"]
+        parent_wallet = (
+            db_session.query(Account)
+            .filter(
+                Account.user_id == registered_user.id,
+                Account.family_id == registered_user.family_id,
+                Account.account_type == AccountType.PARENT_WALLET.value,
+            )
+            .one()
+        )
+        assert parent_wallet.balance == 0
 
         # Login with correct password
         login_res = client.post(

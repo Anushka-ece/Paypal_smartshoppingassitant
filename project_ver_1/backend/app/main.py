@@ -48,3 +48,8 @@ app.include_router(purchase_requests.router)
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the AI-Powered PayPal Family Budgeting & Allowance Management Platform"}
+
+
+@app.get("/health", include_in_schema=False)
+def health_check():
+    return {"status": "ok"}
